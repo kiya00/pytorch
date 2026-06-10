@@ -1733,6 +1733,48 @@ class TritonTensorDescriptorTestCUDA(BlockDescriptorTestBase):
         inp = torch.zeros(16, dtype=torch.bool, device=GPU_TYPE)
         self._run_and_compare(fn, inp, expected_num_block_pointers=0)
 
+    def test_tma_config_filter_preserves_tile_product(self):
+        """
+        _maybe_filter_configs_for_tma_restrictions must shrink other block
+        dimensions when raising one to satisfy TMA minimums, to avoid
+        exceeding shared memory limits.
+        """
+        from triton import Config
+
+        from torch._inductor.runtime.triton_heuristics import (
+            _maybe_filter_configs_for_tma_restrictions,
+        )
+
+        def tile_product(kwargs):
+            p = 1
+            for v in kwargs.values():
+                p *= v
+            return p
+
+        # Case 1: XBLOCK raised 2->512, R0_BLOCK must shrink
+        configs = [Config({"XBLOCK": 2, "R0_BLOCK": 1024}, num_warps=8, num_stages=1)]
+        meta = {"tma_min_block_sizes": {"R0_BLOCK": 4, "XBLOCK": 512}}
+        result = _maybe_filter_configs_for_tma_restrictions(meta, configs)
+        g = result[0]
+        self.assertGreaterEqual(g.kwargs["XBLOCK"], 512)
+        self.assertLessEqual(tile_product(g.kwargs), 2 * 1024)
+
+        # Case 2: XBLOCK raised 2->2048, R0_BLOCK shrinks to fit smem
+        configs = [Config({"XBLOCK": 2, "R0_BLOCK": 512}, num_warps=8, num_stages=1)]
+        meta = {"tma_min_block_sizes": {"XBLOCK": 2048}}
+        result = _maybe_filter_configs_for_tma_restrictions(meta, configs)
+        g = result[0]
+        self.assertGreaterEqual(g.kwargs["XBLOCK"], 2048)
+        self.assertLess(g.kwargs["R0_BLOCK"], 512)
+        self.assertLess(tile_product(g.kwargs) * 4, 232448)
+
+        # Case 3: already satisfies minimums, no change
+        configs = [Config({"XBLOCK": 64, "R0_BLOCK": 8}, num_warps=4, num_stages=1)]
+        meta = {"tma_min_block_sizes": {"XBLOCK": 4, "R0_BLOCK": 4}}
+        result = _maybe_filter_configs_for_tma_restrictions(meta, configs)
+        self.assertEqual(result[0].kwargs["XBLOCK"], 64)
+        self.assertEqual(result[0].kwargs["R0_BLOCK"], 8)
+
 
 test_torchinductor.copy_tests(
     CommonTemplate,
