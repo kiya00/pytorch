@@ -20331,6 +20331,37 @@ if RUN_GPU:
             for a, e in zip(actual, expected):
                 torch.testing.assert_close(a, e)
 
+        @unittest.skipIf(not SM90OrLater, "TMA requires SM90+")
+        @config.patch(
+            {
+                "triton.use_tensor_descriptor": True,
+                "assume_aligned_inputs": True,
+            }
+        )
+        def test_tma_descriptor_aoti_eager_scratch_buffer(self):
+            # Regression test: when TMA generates a kernel with a scratch buffer,
+            # the AOTI cpp wrapper must emit CACHE_TORCH_DEVICE(cuda) so the
+            # cached_torch_device_type_cuda variable is declared before use.
+            ns = "aten"
+            op_name = "clamp"
+            dispatch_key = "CUDA"
+            device = GPU_TYPE
+
+            inp = torch.randn(128, dtype=torch.float, device=device)
+            lo = inp - 0.05
+            hi = inp + 0.05
+
+            ref_out = torch.empty_like(inp)
+            ref = torch.clamp(inp, min=lo, max=hi, out=ref_out)
+
+            with _scoped_library("aten", "IMPL") as lib:
+                register_ops_with_aoti_compile(ns, [op_name], dispatch_key, lib)
+                res_out = torch.empty_like(inp)
+                res = torch.clamp(inp, min=lo, max=hi, out=res_out)
+
+            self.assertEqual(ref, res)
+            self.assertEqual(ref_out, res_out)
+
     class RNNTest(TestCase):
         device_type = GPU_TYPE
 

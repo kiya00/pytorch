@@ -262,12 +262,23 @@ class WorkspaceArg(CodegenSymbol):
 
 
 class TritonScratchWorkspace:
-    def __init__(self, size: int, generate_dtype_str: Callable[..., str]):
+    def __init__(
+        self,
+        size: int,
+        generate_dtype_str: Callable[..., str],
+        generate_device_type_str: Callable[..., str] | None = None,
+    ):
         self.size = size
         self._generate_dtype_str = generate_dtype_str
+        self._generate_device_type_str = generate_device_type_str
 
     def generate_dtype_str(self) -> str:
         return self._generate_dtype_str()
+
+    def generate_device_type_str(self) -> str:
+        if self._generate_device_type_str is not None:
+            return self._generate_device_type_str()
+        return ""
 
 
 @dataclasses.dataclass
