@@ -3909,9 +3909,31 @@ def _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs: list[Conf
         # Add a config that is guaranteed to compile
         example_config = configs[0]
         config_block_sizes = {**example_config.kwargs}
+        original_tile_product = conditional_product(*config_block_sizes.values())
         for block_type, min_block_value in tma_min_block_sizes.items():
             existing = config_block_sizes.get(block_type, 1)
             config_block_sizes[block_type] = max(existing, min_block_value)
+
+        # Shrink other block sizes to preserve the original tile product.
+        # Raising one block dimension to satisfy TMA minimums can blow past
+        # shared memory limits if other dimensions stay large.
+        current_tile_product = conditional_product(*config_block_sizes.values())
+        if current_tile_product > original_tile_product:
+            shrinkable = [
+                k
+                for k in config_block_sizes
+                if k not in tma_min_block_sizes
+                or config_block_sizes[k] > tma_min_block_sizes[k]
+            ]
+            for k in shrinkable:
+                floor = tma_min_block_sizes.get(k, 1)
+                while (
+                    config_block_sizes[k] > floor
+                    and conditional_product(*config_block_sizes.values())
+                    > original_tile_product
+                ):
+                    config_block_sizes[k] //= 2
+
         new_configs = [
             Config(
                 config_block_sizes,
