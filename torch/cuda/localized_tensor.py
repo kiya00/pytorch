@@ -136,7 +136,7 @@ class _LocalizationContext:
             GreenContext,
             is_localization_supported,
         )
-        from torch.cuda.memory import LocalizedAllocator, MemPool
+        from torch.cuda.memory import LocalizedAllocator
 
         if not is_localization_supported(device):
             raise RuntimeError(
@@ -149,10 +149,16 @@ class _LocalizationContext:
         gcs = GreenContext.split(
             locality_domain_ids=tuple(range(num_domains)), device_id=device
         )
+        from torch._inductor.cudagraph_trees import _CudagraphManagedMemPool
+
+        # Only the branch pools are managed by cudagraph trees: a checkpoint restore
+        # must never free weight halves, which live in the plain weight_pools.
         # Native pools belong to the current device, independently of allocator.device_id.
         with torch.cuda.device(device):
             pools = [
-                MemPool(LocalizedAllocator(i, device=device).allocator())
+                _CudagraphManagedMemPool(
+                    LocalizedAllocator(i, device=device).allocator()
+                )
                 for i in range(num_domains)
             ]
 
@@ -516,10 +522,14 @@ class _LocalizedTensor(torch.Tensor):
                 else:
                     per_branch_kwargs[keyword] = per_branch[b]
 
+            # Stream contexts supply Dynamo's per-branch stream metadata to Inductor.
             with torch.cuda.stream(stream):
                 stream.wait_event(primary._default_event)
-                with torch.cuda.use_mem_pool(
-                    primary._ctx.mempools[b], device=primary._ctx.device
+                with (
+                    torch.fx.traceback.annotate({"localization": True}),
+                    torch.cuda.use_mem_pool(
+                        primary._ctx.mempools[b], device=primary._ctx.device
+                    ),
                 ):
                     h = func(*per_branch_args, **per_branch_kwargs)
                 evt.record(stream)
