@@ -156,6 +156,16 @@ class _LocalizationContext:
                 for i in range(num_domains)
             ]
 
+        from torch._inductor.cudagraph_trees import register_external_mem_pool
+
+        # The per-device context owns these pools for process lifetime. Keep them
+        # registered across cudagraph-tree / Dynamo resets so later compilations of
+        # localized models continue to capture with them. Only the branch pools are
+        # registered: a checkpoint restore must never free weight halves, which live
+        # in the unregistered weight_pools.
+        for pool in pools:
+            register_external_mem_pool(pool, device=device)
+
         ctx = _LocalizationContext(gcs, pools, device)
         _LOCALIZATION_CONTEXT_CACHE[device] = ctx
         return ctx
@@ -565,10 +575,14 @@ class _LocalizedTensor(torch.Tensor):
                 else:
                     per_branch_kwargs[keyword] = per_branch[b]
 
+            # Stream contexts supply Dynamo's per-branch stream metadata to Inductor.
             with torch.cuda.stream(stream):
                 stream.wait_event(primary._default_event)
-                with torch.cuda.use_mem_pool(
-                    primary._ctx.mempools[b], device=primary._ctx.device
+                with (
+                    torch.fx.traceback.annotate({"localization": True}),
+                    torch.cuda.use_mem_pool(
+                        primary._ctx.mempools[b], device=primary._ctx.device
+                    ),
                 ):
                     h = func(*per_branch_args, **per_branch_kwargs)
                 evt.record(stream)

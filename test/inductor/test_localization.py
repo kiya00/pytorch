@@ -14,15 +14,22 @@ Pointwise tails (relu, bias-add, gelu, ...) consume the concatenated output.
 
 import contextlib
 import functools
+import os
+import re
 import unittest
 import warnings
 from unittest import mock
 
 import torch
+import torch._inductor.config as inductor_config
 import torch.nn as nn
 import torch.nn.functional as F
+from torch._dynamo.utils import counters
+from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_utils import (
+    get_cycles_per_ms,
     HardwareClassification,
+    parametrize,
     run_tests,
     TestCase,
 )
@@ -383,6 +390,40 @@ class _LinearMergeInnerSplit(nn.Module):
 # ---------------------------------------------------------------------------
 # Drive helpers.
 # ---------------------------------------------------------------------------
+
+
+def _capture_localized_aot(module, *forward_args):
+    """Compile *module* (which must already be localized) through the
+    AOT path and return the post-AOT FX graph.
+
+    The capture goes through ``aot_module_simplified`` directly so that
+    inductor's own lowering is bypassed -- we only need the desugared FX
+    graph.  Localization writes per-branch ``aten.mm`` / ``aten.addmm``
+    nodes there, plus an ``aten.cat`` per linear, plus
+    ``meta["custom"]["stream"] = idx`` on each per-branch node.
+    """
+    captured = []
+
+    def aot_compiler(gm_aot, example_inputs):
+        captured.append(gm_aot)
+        return gm_aot
+
+    def capturing_backend(gm, example_inputs):
+        from torch._functorch.aot_autograd import aot_module_simplified
+
+        return aot_module_simplified(
+            gm,
+            example_inputs,
+            fw_compiler=aot_compiler,
+        )
+
+    compiled = torch.compile(module, backend=capturing_backend, fullgraph=False)
+    with torch.inference_mode():
+        compiled(*forward_args)
+        torch.cuda.synchronize()
+    if not captured:
+        raise AssertionError("post-AOT graph was not captured")
+    return captured[0]
 
 
 def _eager_and_localized(module_cls, ctor_args, forward_args, dtype=torch.float32):
@@ -1185,6 +1226,386 @@ class TestLocalizationDtypes(TestCase):
             _OneLinear, (64, 128), (x,), dtype=torch.bfloat16
         )
         torch.testing.assert_close(y_l, y_e, atol=5e-3, rtol=5e-3)
+
+
+class TestConcatMemPool(TestCase):
+    hw_classification = HardwareClassification.CUDA
+
+    @inductor_config.patch({"triton.cudagraphs": False, "force_disable_caches": True})
+    @parametrize(
+        "placement", ["default", "same", "to_default", "from_default", "different"]
+    )
+    def test_cat_pool_placement(self, device, placement):
+        from torch._inductor.utils import run_and_get_code
+
+        torch._dynamo.reset()
+        pool = torch.cuda.MemPool()
+        other_pool = torch.cuda.MemPool()
+        src_pool = None if placement in ("default", "from_default") else pool
+        dst_pool = {
+            "default": None,
+            "same": pool,
+            "to_default": None,
+            "from_default": pool,
+            "different": other_pool,
+        }[placement]
+
+        def fn(x, w0, w1):
+            with (
+                torch.cuda.use_mem_pool(src_pool)
+                if src_pool is not None
+                else contextlib.nullcontext()
+            ):
+                y0 = x @ w0
+                y1 = x @ w1
+            with (
+                torch.cuda.use_mem_pool(dst_pool)
+                if dst_pool is not None
+                else contextlib.nullcontext()
+            ):
+                return torch.cat((y0, y1), dim=-1)
+
+        x = torch.randn(64, 128, device=device)
+        w0 = torch.randn(128, 256, device=device)
+        w1 = torch.randn(128, 256, device=device)
+        expected = fn(x, w0, w1)
+        actual, codes = run_and_get_code(torch.compile(fn, fullgraph=True), x, w0, w1)
+        self.assertEqual(actual, expected)
+        code = "\n".join(codes)
+        allocations = len(re.findall(r" = empty_strided_cuda\(", code))
+        copies = len(re.findall(r"^\s+triton_poi_\w+\.run\(", code, re.MULTILINE))
+        self.assertEqual(allocations, 1)
+        self.assertEqual(copies, 0)
+
+    @_requires_green_contexts
+    @inductor_config.patch({"triton.cudagraphs": False, "force_disable_caches": True})
+    @parametrize("bias", [False, True])
+    @parametrize("backend", ["ATEN", "TRITON"])
+    def test_localized_cat_preserves_copies(self, device, bias, backend):
+        from torch._inductor.utils import run_and_get_code
+        from torch.testing._internal.common_cuda import tf32_off
+
+        torch._dynamo.reset()
+        model = nn.Linear(128, 512, bias=bias, device=device).eval()
+        x = torch.randn(64, 128, device=device)
+        with torch.inference_mode(), tf32_off():
+            expected = model(x)
+            torch.cuda.localize(model)
+            with inductor_config.patch(
+                max_autotune=backend == "TRITON", max_autotune_gemm_backends=backend
+            ):
+                compiled = torch.compile(model, fullgraph=True)
+                actual, codes = run_and_get_code(compiled, x)
+        self.assertEqual(actual, expected)
+        code = "\n".join(codes)
+        self.assertEqual(len(re.findall(r" = empty_strided_cuda\(", code)), 3)
+        copies = re.findall(r"^\s+triton_poi_\w+\.run\(", code, re.MULTILINE)
+        self.assertEqual(len(copies), 2)
+        self.assertEqual(code.count("with torch.cuda.use_mem_pool("), 2)
+
+
+instantiate_device_type_tests(TestConcatMemPool, globals(), only_for="cuda")
+
+
+class TestLocalizationCudagraphs(TestCase):
+    hw_classification = HardwareClassification.CUDA
+
+    def setUp(self):
+        super().setUp()
+        torch._dynamo.reset()
+
+    def tearDown(self):
+        torch._dynamo.reset()
+        super().tearDown()
+
+    @_requires_green_contexts
+    @torch.inference_mode()
+    @parametrize("compiled", (False, True))
+    def test_different_caller_streams(self, device, compiled):
+        model = nn.Linear(8, 8, bias=False, device=device)
+        model.weight.fill_(1)
+        x1 = torch.ones(4, 8, device=device)
+        x2 = torch.zeros_like(x1)
+        torch.cuda.localize(model)
+        fn = (
+            torch.compile(model, fullgraph=True, options={"triton.cudagraphs": False})
+            if compiled
+            else model
+        )
+        first, second = torch.cuda.Stream(), torch.cuda.Stream()
+        first.wait_stream(torch.cuda.current_stream())
+        # Warm up allocations so the test exercises buffer reuse.
+        with torch.cuda.stream(first):
+            fn(x1)
+        torch.cuda.synchronize()
+        # Delay cat so the second call can overwrite the first branch's output.
+        delay = int(50 * get_cycles_per_ms())
+        with torch.cuda.stream(model.weight._streams[1]):
+            torch.cuda._sleep(delay)
+        with torch.cuda.stream(first):
+            out = fn(x1)
+        with torch.cuda.stream(second):
+            fn(x2)
+        torch.cuda.synchronize()
+        self.assertEqual(out, torch.full_like(out, 8))
+
+    @_requires_green_contexts
+    @torch.inference_mode()
+    @inductor_config.patch("triton.slow_path_cudagraph_asserts", True)
+    def test_localize_after_replay(self, device):
+        from torch._inductor.cudagraph_trees import get_container
+
+        x = torch.randn(8, 256, device=device)
+        a = nn.Linear(256, 256, device=device)
+        ref_a = a(x)
+        torch.cuda.localize(a)
+        compiled_a = torch.compile(a, mode="reduce-overhead", fullgraph=True)
+        for _ in range(3):
+            compiled_a(x)
+
+        b = nn.Linear(256, 256, device=device)
+        ref_b = b(x)
+        torch.cuda.localize(b)
+        h = torch.compile(torch.sin, mode="reduce-overhead", fullgraph=True)
+        h(x)
+
+        c = nn.Linear(256, 256, device=device)
+        ref_c = c(x)
+        torch.cuda.localize(c)
+        self.assertEqual(a(x), ref_a)
+        self.assertEqual(b(x), ref_b)
+        self.assertEqual(c(x), ref_c)
+        manager = get_container(x.device.index).tree_manager
+        self.assertIsNotNone(manager)
+        self.assertGreater(manager.debug_checkpointing_counter, 0)
+
+    @torch.inference_mode()
+    def test_rejects_cached_workspace(self, device):
+        model = nn.Linear(8, 8, device=device)
+        with mock.patch.dict(os.environ, TORCH_CUBLAS_WORKSPACE_CACHE="1"):
+            with self.assertRaisesRegex(RuntimeError, "TORCH_CUBLAS_WORKSPACE_CACHE"):
+                torch.cuda.localize(model)
+        for param in model.parameters():
+            self.assertIs(type(param), nn.Parameter)
+
+
+instantiate_device_type_tests(TestLocalizationCudagraphs, globals(), only_for="cuda")
+
+
+class TestLocalizationAllocatorMeta(TestCase):
+    """Per-branch matmul outputs (and any pointwise tail duplicates) are
+    routed into the matching locality-domain mempool.  These tests pin
+    three layers of that contract:
+
+    * the localized dispatch stamps ``meta['custom']['mempool']`` on
+      every per-branch FX node, paired by branch with the existing
+      ``stream`` index;
+    * the inductor wrapper consumes that meta and emits
+      ``with torch.cuda.use_mem_pool(...)`` around the matching
+      scheduler node's allocations;
+    * non-localized compiles still produce single-pool allocations.
+
+    Performance measurements live in
+    ``benchmarks/localization/test_localization_benchmark.py``.
+    """
+
+    hw_classification = HardwareClassification.CUDA
+
+    def setUp(self):
+        super().setUp()
+        torch._dynamo.reset()
+
+    @_requires_green_contexts
+    def test_per_branch_nodes_carry_paired_stream_and_mempool_meta(self):
+        """Each per-branch matmul node carries both ``stream`` and
+        ``mempool``; the two indices are paired by branch (same node
+        carries matching (stream, mempool)); the two branches use
+        distinct pairs."""
+        m = _OneLinear(4096, 4096, bias=False, dtype=torch.bfloat16).cuda().eval()
+        with torch.inference_mode():
+            torch.cuda.localize(m)
+        x = torch.randn(16, 4096, dtype=torch.bfloat16, device="cuda")
+        gm = _capture_localized_aot(m, x)
+
+        aten = torch.ops.aten
+        pairs: set = set()
+        for n in gm.graph.nodes:
+            if n.op != "call_function":
+                continue
+            if n.target not in (aten.mm.default, aten.addmm.default):
+                continue
+            c = n.meta.get("custom") or {}
+            self.assertIs(c.get("localization"), True)
+            s, a = c.get("stream"), c.get("mempool")
+            self.assertIsNotNone(
+                s,
+                f"per-branch matmul {n} should carry stream meta",
+            )
+            self.assertIsNotNone(
+                a,
+                f"per-branch matmul {n} should carry mempool meta",
+            )
+            pairs.add((s, a))
+
+        self.assertEqual(
+            len(pairs),
+            2,
+            f"expected two distinct (stream, mempool) pairs across "
+            f"the two branches, got {pairs}",
+        )
+        streams = {s for s, _ in pairs}
+        allocs = {a for _, a in pairs}
+        self.assertEqual(
+            len(streams),
+            2,
+            f"per-branch streams must be distinct, got {streams}",
+        )
+        self.assertEqual(
+            len(allocs),
+            2,
+            f"per-branch mempool indices must be distinct, got {allocs}",
+        )
+
+    @_requires_green_contexts
+    def test_cat_join_carries_no_mempool_meta(self):
+        """The trailing ``aten.cat`` produced by the dispatch join is
+        outside every branch, so it must NOT inherit either ``stream``
+        or ``mempool`` meta."""
+        m = _OneLinear(4096, 4096, bias=False, dtype=torch.bfloat16).cuda().eval()
+        with torch.inference_mode():
+            torch.cuda.localize(m)
+        x = torch.randn(16, 4096, dtype=torch.bfloat16, device="cuda")
+        gm = _capture_localized_aot(m, x)
+        cats = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function" and n.target is torch.ops.aten.cat.default
+        ]
+        self.assertTrue(cats, "expected at least one cat in localized graph")
+        for n in cats:
+            c = n.meta.get("custom") or {}
+            self.assertNotIn("localization", c)
+            self.assertNotIn("stream", c, f"cat {n} should not carry stream meta")
+            self.assertNotIn("mempool", c, f"cat {n} should not carry mempool meta")
+
+    @_requires_green_contexts
+    def test_output_code_wraps_per_branch_allocations(self):
+        """The inductor wrapper emits ``with torch.cuda.use_mem_pool(...)``
+        around the per-branch ``empty_strided_cuda`` calls."""
+        from torch._inductor.utils import run_and_get_code
+
+        model = _LinearReLU(4096, 4096, bias=False).cuda().eval().to(torch.bfloat16)
+        with torch.inference_mode():
+            torch.cuda.localize(model)
+            x = torch.randn(16, 4096, dtype=torch.bfloat16, device="cuda")
+            _, codes = run_and_get_code(torch.compile(model, fullgraph=True), x)
+
+        self.assertTrue(codes, "no codegen captured from compile")
+        code = "\n\n".join(codes)
+        # The stream context and alignment copies may sit between the pool
+        # wrap and the allocation, so only require the allocation somewhere
+        # inside the wrapped block.
+        self.assertRegex(
+            code,
+            r"with torch\.cuda\.use_mem_pool\(\s*get_external_object_by_index\(\d+\),"
+            r"\s*device=\d+\s*\):"
+            r"(?:\n[^\n]*)*?\n\s+\w+ = empty_strided_cuda\(",
+            "expected `with use_mem_pool(..., device=N):` followed by an "
+            "indented `empty_strided_cuda(...)` call within the block",
+        )
+
+    @_requires_green_contexts
+    def test_non_localized_compile_has_no_use_mem_pool_wrap(self):
+        """A baseline (non-localized) compile of the same kind of model
+        must NOT contain any ``use_mem_pool`` wrap.  This is the
+        non-localized-user-code invariant the mempool path commits to."""
+        from torch._inductor.utils import run_and_get_code
+
+        model = _LinearReLU(4096, 4096, bias=False).cuda().eval().to(torch.bfloat16)
+        x = torch.randn(16, 4096, dtype=torch.bfloat16, device="cuda")
+        with torch.inference_mode():
+            _, codes = run_and_get_code(torch.compile(model, fullgraph=True), x)
+
+        self.assertTrue(codes, "no codegen captured from compile")
+        self.assertNotIn("use_mem_pool", "\n\n".join(codes))
+
+    @_requires_green_contexts
+    def test_runtime_numerics_match_eager(self):
+        """Compiled localized forward matches eager forward to within
+        bf16 tolerance.  Confirms the use_mem_pool wraps don't perturb
+        results (they shouldn't -- they only redirect where storage is
+        allocated, not what gets computed)."""
+        torch.manual_seed(0)
+        eager_model = (
+            _LinearReLU(4096, 4096, bias=False).cuda().eval().to(torch.bfloat16)
+        )
+        loc_model = _LinearReLU(4096, 4096, bias=False).cuda().eval().to(torch.bfloat16)
+        loc_model.load_state_dict(eager_model.state_dict())
+        with torch.inference_mode():
+            torch.cuda.localize(loc_model)
+
+        x = torch.randn(16, 4096, dtype=torch.bfloat16, device="cuda")
+        with torch.inference_mode():
+            ref = eager_model(x)
+            opt = torch.compile(loc_model, fullgraph=True)
+            out = opt(x)
+            torch.cuda.synchronize()
+        torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+    @_requires_green_contexts
+    def test_compiled_numerics_match_eager_triton_fused(self):
+        """Companion to test_runtime_numerics_match_eager: compile with
+        max_autotune_gemm_backends="TRITON" so the matmul lowers to a
+        Triton template instead of extern_kernels.mm, and on a workload
+        (Linear -> GELU -> Linear) that gives the template a fusible
+        epilogue.  The default-backend numerics path is already covered
+        above; this exercises the Triton-template path for the same
+        localized forward."""
+        torch.manual_seed(0)
+        eager_model = _LinearGELULinear(64, 64, 32).cuda().eval().to(torch.bfloat16)
+        loc_model = _LinearGELULinear(64, 64, 32).cuda().eval().to(torch.bfloat16)
+        loc_model.load_state_dict(eager_model.state_dict())
+        with torch.inference_mode():
+            torch.cuda.localize(loc_model)
+
+        x = torch.randn(16, 64, dtype=torch.bfloat16, device="cuda")
+        with inductor_config.patch(
+            {
+                "max_autotune_gemm": True,
+                "max_autotune_gemm_backends": "TRITON",
+            }
+        ):
+            with torch.inference_mode():
+                ref = eager_model(x)
+                opt = torch.compile(loc_model, fullgraph=True)
+                out = opt(x)
+                torch.cuda.synchronize()
+        torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+    @_requires_green_contexts
+    def test_fused_qkv_split_compiled(self):
+        """Compiled (reduce-overhead) companion to test_fused_qkv_split: the
+        CUDA-graph-captured localized forward must match eager."""
+        torch.manual_seed(0)
+        hidden, num_heads, head_dim, batch, seq_len = 64, 4, 16, 2, 8
+        eager_model = _FusedQKV(hidden, num_heads, head_dim).cuda().eval()
+        loc_model = _FusedQKV(hidden, num_heads, head_dim).cuda().eval()
+        loc_model.load_state_dict(eager_model.state_dict())
+        with torch.inference_mode():
+            torch.cuda.localize(loc_model)
+        x = torch.randn(batch * seq_len, hidden, device="cuda")
+        counters.clear()
+        with torch.inference_mode():
+            ref = eager_model(x, batch, seq_len)
+            opt = torch.compile(loc_model, fullgraph=True, mode="reduce-overhead")
+            # Warm up so the CUDA graph is captured + replayed.
+            for _ in range(3):
+                out = opt(x, batch, seq_len)
+            torch.cuda.synchronize()
+        torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+        # The point of this test is the captured graph; a skip would silently
+        # downgrade it to an eager-ish run that still matches numerically.
+        self.assertEqual(counters["inductor"]["cudagraph_skips"], 0)
 
 
 class TestLocalizationRequiresInferenceMode(TestCase):

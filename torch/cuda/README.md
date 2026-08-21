@@ -66,11 +66,13 @@ x = torch.randn(8, 256, device="cuda")
 
 with torch.inference_mode():
     mod = torch.cuda.localize(mod)
-    out = mod(x)
+    compiled_mod = torch.compile(mod, mode="reduce-overhead")
+    out = compiled_mod(x)
 ```
 
 Localization and subsequent forward calls must run inside `torch.inference_mode()`.
 Keep `TORCH_CUBLAS_WORKSPACE_CACHE` unset or `0` before starting the process.
+Compiling the localized module with `mode="reduce-overhead"`, as shown above, is strongly recommended.
 
 The internal `_register_localizable_op` helper can register custom operations
 prior to invoking `torch.cuda.localize`; it is not a public API.
@@ -91,7 +93,7 @@ downstream ops are unaffected.
 
 ### Issues and limitations
 
-#### Per-op overhead
+#### CUDA Graphs are necessary to reduce overhead
 
 For every localizable op, we do considerable additional work:
 
@@ -107,6 +109,9 @@ For every localizable op, we do considerable additional work:
 This adds latency per localizable op and can dominate performance for small ops.
 There is also additional overhead during `torch.cuda.localize`, as it reallocates
 weights using a slower mechanism than the normal allocator.
+
+CUDA graphs reduce CPU launch overhead by replaying the captured work.
+Use `torch.compile(..., mode='reduce-overhead')` to enable CUDA graphs.
 
 #### No cost model
 
