@@ -331,6 +331,7 @@ Save after instantiation and before resetting or destroying the graph.
     :nosignatures:
 
      empty_cache
+     empty_allocator_cache
      get_per_process_memory_fraction
      list_gpu_processes
      mem_get_info
@@ -357,9 +358,11 @@ Save after instantiation and before resetting or destroying the graph.
      caching_allocator_delete
      get_allocator_backend
      CUDAPluggableAllocator
+     CUDAPluggableManagedPoolAllocator
      change_current_allocator
      MemPool
      LocalizedAllocator
+     VMMHalfSplitAllocator
 ```
 
 ```{eval-rst}

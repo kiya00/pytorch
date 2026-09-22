@@ -1113,6 +1113,37 @@ def _raw_device_count_nvml() -> int:
     return dev_count.value
 
 
+def _raw_device_capability_nvml(device: Device) -> tuple[int, int] | None:
+    r"""Return a device's CUDA compute capability, or None if NVML is unavailable."""
+    from ctypes import byref, c_int, c_void_p, CDLL
+
+    try:
+        nvml_h = CDLL("libnvidia-ml.so.1")
+        if nvml_h.nvmlInit() != 0:
+            return None
+        device_index = _get_nvml_device_index(device)
+        device_handle = c_void_p()
+        if (
+            nvml_h.nvmlDeviceGetHandleByIndex_v2(device_index, byref(device_handle))
+            != 0
+        ):
+            raise RuntimeError(f"NVML cannot get handle for device {device_index}")
+        major = c_int()
+        minor = c_int()
+        if (
+            nvml_h.nvmlDeviceGetCudaComputeCapability(
+                device_handle, byref(major), byref(minor)
+            )
+            != 0
+        ):
+            raise RuntimeError(
+                f"NVML cannot get compute capability for device {device_index}"
+            )
+        return major.value, minor.value
+    except (AttributeError, IndexError, OSError):
+        return None
+
+
 def _raw_device_uuid_amdsmi() -> list[str] | None:
     from ctypes import byref, c_int, c_void_p, CDLL, create_string_buffer
 
@@ -1602,6 +1633,13 @@ def _get_amdsmi_device_index(device: Device) -> int:
         return idx_map[idx]
     else:
         return _get_amdsmi_device_index_from_hip_index(idx_map[idx])
+
+
+from .localized_tensor import localize
+
+# Import after _get_nvml_device_index / _get_amdsmi_device_index / _lazy_init exist:
+# memory.py imports those from this package; an early import would circular-import.
+from .memory import LocalizedMemPool, VMMHalfSplitAllocator
 
 
 def _get_amdsmi_device_memory_used(device: Device = None) -> int:
@@ -2199,6 +2237,8 @@ __all__ = [
     "Stream",
     "StreamContext",
     "GreenContext",
+    "LocalizedMemPool",
+    "VMMHalfSplitAllocator",
     "amp",
     "caching_allocator_alloc",
     "caching_allocator_delete",
@@ -2218,11 +2258,13 @@ __all__ = [
     "device_count",
     "device_memory_used",
     "device_of",
+    "empty_allocator_cache",
     "empty_cache",
     "export_dot",
     "export_graph_data",
     "get_allocator_backend",
     "CUDAPluggableAllocator",
+    "CUDAPluggableManagedPoolAllocator",
     "change_current_allocator",
     "get_arch_list",
     "get_device_capability",
@@ -2252,6 +2294,7 @@ __all__ = [
     "is_tf32_supported",
     "jiterator",
     "list_gpu_processes",
+    "localize",
     "make_graphed_callables",
     "manual_seed",
     "manual_seed_all",

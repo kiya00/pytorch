@@ -34,7 +34,6 @@ from .green_contexts import get_num_locality_domains, is_localization_supported
 if TYPE_CHECKING:
     from torch.types import Device
 
-
 __all__ = [
     "caching_allocator_alloc",
     "caching_allocator_delete",
@@ -43,6 +42,7 @@ __all__ = [
     "get_per_process_memory_fraction",
     "set_per_process_memory_fraction",
     "empty_cache",
+    "empty_allocator_cache",
     "memory_stats",
     "memory_stats_as_nested_dict",
     "reset_accumulated_memory_stats",
@@ -64,7 +64,10 @@ __all__ = [
     "list_gpu_processes",
     "mem_get_info",
     "get_allocator_backend",
+    "LocalizedMemPool",
+    "VMMHalfSplitAllocator",
     "CUDAPluggableAllocator",
+    "CUDAPluggableManagedPoolAllocator",
     "change_current_allocator",
     "MemPool",
     "LocalizedAllocator",
@@ -75,6 +78,10 @@ __all__ = [
 if not hasattr(torch._C, "_cuda_CUDAAllocator"):
     # Define dummy base classes
     torch._C.__dict__["_cuda_CUDAAllocator"] = _dummy_type("_cuda_CUDAAllocator")
+
+
+if not hasattr(torch._C, "_VMMHalfSplitAllocator"):
+    torch._C.__dict__["_VMMHalfSplitAllocator"] = _dummy_type("_VMMHalfSplitAllocator")
 
 
 if not hasattr(torch._C, "_MemPool"):
@@ -98,6 +105,7 @@ from torch._C import (  # noqa: F401
     _cuda_endAllocateToPool,
     _cuda_releasePool,
     _MemPool,
+    _VMMHalfSplitAllocator,
 )
 
 
@@ -243,6 +251,22 @@ def _recurse_add_to_result(result, prefix, obj, format_key):
             _recurse_add_to_result(result, prefix + format_key(key), value, format_key)
     else:
         result.append((prefix, obj))
+
+
+def empty_allocator_cache(pool: "MemPool") -> None:
+    r"""Release cached memory held by an allocator-managed pool.
+
+    This drains completed deferred frees before releasing memory cached by the
+    pool's custom allocator. Non-managed pools are not supported.
+
+    Args:
+        pool (torch.cuda.MemPool): allocator-managed memory pool whose
+            cache should be released.
+    """
+    if not isinstance(pool, _MemPool):
+        raise TypeError("pool must be a torch.cuda.MemPool")
+    if is_initialized():
+        torch._C._cuda_emptyAllocatorCache(pool)
 
 
 def memory_stats(device: "Device" = None) -> dict[str, Any]:
@@ -1665,6 +1689,48 @@ class CUDAPluggableAllocator(_CUDAAllocator):
         self._allocator = torch._C._cuda_customAllocator(alloc_fn, free_fn)
 
 
+class CUDAPluggableManagedPoolAllocator(CUDAPluggableAllocator):
+    r"""Function-pointer allocator helper for an allocator-managed :class:`MemPool`.
+
+    Args:
+        path_to_so_file: Path to the shared library containing the callbacks.
+        alloc_fn_name: Allocation callback with the same signature required by
+            :class:`CUDAPluggableAllocator`.
+        free_fn_name: Free callback with the same signature required by
+            :class:`CUDAPluggableAllocator`.
+        empty_cache_fn_name: Optional ``void empty_cache_fn_name()`` callback.
+
+    This helper does not add checkpoint support. A C++ subclass must override the
+    allocator checkpoint methods when checkpoint consumers need exact restoration.
+    """
+
+    def __init__(
+        self,
+        path_to_so_file: str,
+        alloc_fn_name: str,
+        free_fn_name: str,
+        empty_cache_fn_name: str | None = None,
+    ):
+        allocator = ctypes.CDLL(path_to_so_file)
+        alloc_fn = ctypes.cast(getattr(allocator, alloc_fn_name), ctypes.c_void_p).value
+        free_fn = ctypes.cast(getattr(allocator, free_fn_name), ctypes.c_void_p).value
+        if empty_cache_fn_name is None:
+            empty_cache_fn = 0
+        else:
+            empty_cache_fn = ctypes.cast(
+                getattr(allocator, empty_cache_fn_name), ctypes.c_void_p
+            ).value
+            if empty_cache_fn is None:
+                raise AssertionError(f"empty_cache_fn '{empty_cache_fn_name}' is None")
+        if alloc_fn is None:
+            raise AssertionError(f"alloc_fn '{alloc_fn_name}' is None")
+        if free_fn is None:
+            raise AssertionError(f"free_fn '{free_fn_name}' is None")
+        self._allocator = torch._C._cuda_customManagedPoolAllocator(
+            alloc_fn, free_fn, empty_cache_fn
+        )
+
+
 def change_current_allocator(allocator: _CUDAAllocator) -> None:
     r"""Change the currently used memory allocator to be the one provided.
 
@@ -1703,6 +1769,13 @@ class MemPool(_MemPool):
             to Out Of Memory. This is False by default.
         no_split(bool): a bool that indicates if this pool should not split a segment.
             This is False by default.
+        allocator_managed(bool): if ``True``, forwards every logical allocation
+            and completed free directly to the supplied allocator, which is
+            responsible for its own caching policy. The default is ``False``, which
+            lets the CUDA caching allocator suballocate and cache blocks supplied
+            by the allocator. The supplied allocator must implement the managed-pool
+            contract documented in :ref:`cuda-memory-management`. Allocator callbacks
+            must not reenter PyTorch's CUDA allocator.
     """
 
     def __init__(
@@ -1710,9 +1783,10 @@ class MemPool(_MemPool):
         allocator: _cuda_CUDAAllocator | None = None,
         use_on_oom: bool = False,
         no_split: bool = False,
+        allocator_managed: bool = False,
     ):
         # pyrefly: ignore [bad-argument-count]
-        super().__init__(allocator, True, use_on_oom, no_split)
+        super().__init__(allocator, True, use_on_oom, no_split, allocator_managed)
 
     @classmethod
     def from_py_allocator(
@@ -1844,6 +1918,83 @@ class LocalizedAllocator(_CUDAAllocator):
     def device_id(self) -> int:
         r"""Return the CUDA device index associated with this allocator."""
         return self._localized_allocator.device_id
+
+
+class LocalizedMemPool(MemPool):
+    r"""MemPool whose allocator targets one CUDA locality domain."""
+
+    def __init__(
+        self,
+        locality_domain_id: int,
+        *,
+        device: "Device" = None,
+        use_on_oom: bool = False,
+        no_split: bool = False,
+    ) -> None:
+        self._localized_allocator = LocalizedAllocator(
+            locality_domain_id,
+            device=device,
+        )
+        with torch.cuda.device(self._localized_allocator.device_id):
+            super().__init__(
+                self._localized_allocator.allocator(),
+                use_on_oom,
+                no_split,
+            )
+
+    @property
+    def locality_domain_id(self) -> int:
+        r"""Return the locality domain ID associated with this pool."""
+        return self._localized_allocator.locality_domain_id
+
+    @property
+    def device_id(self) -> int:
+        r"""Return the CUDA device index associated with this pool."""
+        return self._localized_allocator.device_id
+
+
+class VMMHalfSplitAllocator(MemPool):
+    r"""Allocator-managed MemPool using cached half-split VMM mappings."""
+
+    _vmm_allocator: _VMMHalfSplitAllocator
+
+    def __init__(self, device: "Device" = None) -> None:
+        _lazy_init()
+        device_index = _get_device_index(device, optional=True)
+        with torch.cuda.device(device_index):
+            self._vmm_allocator = _VMMHalfSplitAllocator(device_index)
+            super().__init__(
+                self._vmm_allocator.allocator,
+                allocator_managed=True,
+            )
+
+    def start_recording(self, max_entries: int, *, clear: bool = True) -> None:
+        r"""Start recording VMM mapping and physical-handle events."""
+        self._vmm_allocator.start_recording(max_entries, clear)
+
+    def stop_recording(self) -> None:
+        r"""Stop recording VMM-specific events."""
+        self._vmm_allocator.stop_recording()
+
+    def set_metadata(self, metadata: str) -> None:
+        r"""Attach metadata to subsequently recorded VMM-specific events."""
+        self._vmm_allocator.set_metadata(metadata)
+
+    def vmm_snapshot(self) -> dict[str, Any]:
+        r"""Return VMM mappings, physical-handle stats, and VMM events."""
+        return self._vmm_allocator.snapshot()
+
+    def stats(self) -> dict[str, Any]:
+        r"""Return VMM mapping, cache, memory, and CUDA API counters."""
+        return self._vmm_allocator.stats()
+
+    def reset_peak_stats(self) -> None:
+        r"""Reset peak VMM statistics to their current values."""
+        self._vmm_allocator.reset_peak_stats()
+
+    def reset_accumulated_stats(self) -> None:
+        r"""Reset accumulated request, cache, and CUDA API counters."""
+        self._vmm_allocator.reset_accumulated_stats()
 
 
 @contextlib.contextmanager

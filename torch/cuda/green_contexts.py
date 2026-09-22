@@ -4,9 +4,10 @@ import functools
 import sys
 import threading
 import warnings
+import weakref
 from collections.abc import Sequence
 from ctypes import byref, c_int
-from typing import Any
+from typing import Any, TYPE_CHECKING
 from typing_extensions import deprecated
 
 import torch
@@ -21,9 +22,14 @@ from torch.cuda._utils import (
 )
 
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
 __all__ = [
     "GreenContext",
     "SMPartition",
+    "execute_in_green_contexts",
+    "get_green_context_from_stream",
     "get_num_locality_domains",
     "is_localization_supported",
 ]
@@ -40,6 +46,11 @@ _CONTEXT_STACK_DEPRECATION = (
     "Please create a stream with `GreenContext.Stream()` and use "
     "`torch.cuda.stream(stream)` instead."
 )
+
+_STREAM_TO_GREEN_CTX: weakref.WeakValueDictionary[int, GreenContext] = (
+    weakref.WeakValueDictionary()
+)
+_STREAM_TO_GREEN_CTX_LOCK = threading.RLock()
 
 
 # note: this can safely be cached in a process/thread because
@@ -63,7 +74,7 @@ def _ensure_cuda_version(version: int, message: str) -> None:
 
 
 def _ensure_supported() -> None:
-    if torch.version.cuda is None or torch.version.hip is not None:
+    if not torch.backends.cuda.is_built() or torch.version.hip is not None:
         raise RuntimeError("Green Context is only supported on Nvidia CUDA")
     if sys.platform == "win32":
         raise RuntimeError("Green Context is not supported on Windows")
@@ -520,6 +531,11 @@ class GreenContext:
     as with any other custom stream.
     """
 
+    # __del__ may run while Python is clearing module globals during interpreter
+    # shutdown. Keep stable references on the class for cleanup.
+    _check_cuda_bindings_ = _check_cuda_bindings
+    _drv_ = _drv
+
     def __init__(
         self,
         *,
@@ -527,7 +543,12 @@ class GreenContext:
         sm_partition: SMPartition | None = None,
         workqueue_scope: str | None = None,
         workqueue_concurrency_limit: int | None = None,
+        locality_domain_id: int | None = None,
+        locality_domain_backfill: bool | None = None,
+        locality_domain_remainder: bool | None = None,
+        coscheduled_sm_count: int | None = None,
         device_id: int | None = None,
+        green_context_obj: Any | None = None,
     ) -> None:
         r"""Create a CUDA green context.
 
@@ -550,17 +571,129 @@ class GreenContext:
             workqueue_concurrency_limit (int, optional): Maximum number of
                 concurrent stream-ordered workloads for the workqueue. Requires
                 ``workqueue_scope`` to be set.
-            device_id (int, optional): The device index of green context.
+            locality_domain_id (int, optional): Locality domain whose SMs
+                should back this green context. When ``None``, no locality
+                domain is selected.
+            locality_domain_backfill (bool, optional): If ``True``, supplement
+                the selected locality domain with additional SMs so all
+                locality domains receive an equal share of the device's SMs.
+                May only be specified with ``locality_domain_id``. Defaults to
+                ``None``.
+            locality_domain_remainder (bool, optional): If ``True``, use the
+                device SMs outside the locality domains. Cannot be specified
+                with ``locality_domain_id`` or ``locality_domain_backfill``.
+                Defaults to ``None``.
+            coscheduled_sm_count (int, optional): The minimum number of SMs
+                guaranteed to be co-scheduled for a thread block cluster.
+                This determines the cluster capability of the green context
+                if ``locality_domain_id`` is provided. When ``None`` or zero,
+                it is determined automatically by the system. Defaults to
+                ``None``.
+            device_id (int, optional): The device index used.
                 When ``None``, the current device is used.
+            green_context_obj (optional): Wrap this cuda-bindings green context.
         """
         self._device_id = None
         self._green_ctx = None
         self._context = None
+        # we don't own the green context object until it has been set up
+        self._is_owning = False
         _ensure_supported()
+
+        # if green_context_obj is provided, we just check that nothing else
+        # is provided, and that the context is valid.
+        if green_context_obj is not None:
+            # we require latest support here, to be able to query everything
+            # about the given green context + be able to use cuCtxGetDevice_v2
+            _ensure_locality_supported()
+            other_values = [
+                num_sms,
+                workqueue_scope,
+                workqueue_concurrency_limit,
+                locality_domain_id,
+                locality_domain_backfill,
+                locality_domain_remainder,
+                coscheduled_sm_count,
+                device_id,
+            ]
+            if any(v is not None for v in other_values):
+                raise RuntimeError(
+                    "If green_context_obj is provided, no other argument must be provided to GreenContext()"
+                )
+            # this also checks whether the green context is valid
+            # pyrefly: ignore [missing-attribute]
+            context = _check_cuda_bindings(_drv.cuCtxFromGreenCtx(green_context_obj))
+            if int(context) == 0:
+                raise RuntimeError("Green ctx conversion to regular ctx failed!")
+            # pyrefly: ignore [missing-attribute]
+            device_id = int(_check_cuda_bindings(_drv.cuCtxGetDevice_v2(context)))
+            num_locality_domains = get_num_locality_domains(device_id)
+            sm_res = _check_cuda_bindings(
+                # pyrefly: ignore [missing-attribute]
+                _drv.cuGreenCtxGetDevResource(
+                    # pyrefly: ignore [missing-attribute]
+                    green_context_obj,
+                    # pyrefly: ignore [missing-attribute]
+                    _drv.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM,
+                )
+            )
+            if (
+                sm_res.sm.flags
+                # pyrefly: ignore [missing-attribute]
+                & _drv.CUdevSmResourceGroup_flags.CU_DEV_SM_RESOURCE_GROUP_LOCALITY_DOMAIN_ID
+            ) != 0:
+                locality_domain_id = sm_res.sm.localityDomainId
+            self._init_from_cuda_objects(
+                device_id,
+                green_context_obj,
+                context,
+                locality_domain_id,
+                num_locality_domains,
+            )
+            return
 
         scope_value = _parse_workqueue_scope(workqueue_scope)
         if scope_value is not None:
             _ensure_workqueue_supported()
+        if locality_domain_id is not None or locality_domain_remainder:
+            _ensure_locality_supported()
+
+        if locality_domain_remainder and (
+            locality_domain_id is not None or locality_domain_backfill is not None
+        ):
+            raise RuntimeError(
+                "locality_domain_remainder cannot be specified with "
+                "locality_domain_id or locality_domain_backfill"
+            )
+        if locality_domain_backfill is not None and locality_domain_id is None:
+            raise RuntimeError("locality_domain_backfill requires locality_domain_id")
+        if coscheduled_sm_count is not None and locality_domain_id is None:
+            raise RuntimeError("coscheduled_sm_count requires locality_domain_id")
+        if (locality_domain_id is not None or locality_domain_remainder) and (
+            num_sms is not None or sm_partition is not None
+        ):
+            raise RuntimeError(
+                "locality-domain SM resources cannot be combined with num_sms "
+                "or sm_partition"
+            )
+
+        if locality_domain_id is not None or locality_domain_remainder:
+            source = SMPartition.from_device(device_id)
+            device_id = source.device_id
+            if locality_domain_remainder:
+                domains = tuple(range(get_num_locality_domains(device_id)))
+                _, sm_partition = source.split(locality_domain_ids=domains)
+                if sm_partition is None:
+                    raise RuntimeError(
+                        "No SM resources remain outside locality domains"
+                    )
+            else:
+                partitions, _ = source.split(
+                    coscheduled_sm_count=coscheduled_sm_count or 0,
+                    backfill=bool(locality_domain_backfill),
+                    locality_domain_ids=locality_domain_id,
+                )
+                sm_partition = partitions[0]
 
         if sm_partition is not None and not isinstance(sm_partition, SMPartition):
             raise TypeError("sm_partition must be an SMPartition")
@@ -581,6 +714,12 @@ class GreenContext:
             device_id = sm_partition.device_id
         elif device_id is None:
             device_id = torch.cuda.current_device()
+        num_locality_domains = get_num_locality_domains(device_id)
+        if locality_domain_id is None and sm_partition is not None:
+            try:
+                locality_domain_id = sm_partition.locality_domain_id
+            except RuntimeError:
+                locality_domain_id = None
 
         # pyrefly: ignore [missing-attribute]
         current_ctx = _check_cuda_bindings(_drv.cuCtxGetCurrent())
@@ -595,16 +734,18 @@ class GreenContext:
             _check_cuda_bindings(_rt.cudaFree(0))
 
         # pyrefly: ignore [missing-attribute]
-        device = _check_cuda_bindings(_drv.cuDeviceGet(device_id))
+        drv_device = _check_cuda_bindings(_drv.cuDeviceGet(device_id))
         resources = []
         if sm_partition is not None:
             resources.append(sm_partition._resource)
 
         if num_sms is not None:
             sm_resource = _check_cuda_bindings(
-                _drv.cuDeviceGetDevResource(  # pyrefly: ignore [missing-attribute]
-                    device,
-                    _drv.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM,  # pyrefly: ignore [missing-attribute]
+                # pyrefly: ignore [missing-attribute]
+                _drv.cuDeviceGetDevResource(
+                    drv_device,
+                    # pyrefly: ignore [missing-attribute]
+                    _drv.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM,
                 )
             )
             if num_sms <= 0 or num_sms > sm_resource.sm.smCount:
@@ -613,9 +754,8 @@ class GreenContext:
                     f"{num_sms} (device has {sm_resource.sm.smCount} SMs)"
                 )
             split_result, nb_groups, _remaining = _check_cuda_bindings(
-                _drv.cuDevSmResourceSplitByCount(  # pyrefly: ignore [missing-attribute]
-                    1, sm_resource, 0, num_sms
-                )
+                # pyrefly: ignore [missing-attribute]
+                _drv.cuDevSmResourceSplitByCount(1, sm_resource, 0, num_sms)
             )
             if nb_groups != 1:
                 raise RuntimeError("Failed to create single SM resource group")
@@ -623,9 +763,11 @@ class GreenContext:
 
         if scope_value is not None:
             wq_resource = _check_cuda_bindings(
-                _drv.cuDeviceGetDevResource(  # pyrefly: ignore [missing-attribute]
-                    device,
-                    _drv.CUdevResourceType.CU_DEV_RESOURCE_TYPE_WORKQUEUE_CONFIG,  # pyrefly: ignore [missing-attribute]
+                # pyrefly: ignore [missing-attribute]
+                _drv.cuDeviceGetDevResource(
+                    drv_device,
+                    # pyrefly: ignore [missing-attribute]
+                    _drv.CUdevResourceType.CU_DEV_RESOURCE_TYPE_WORKQUEUE_CONFIG,
                 )
             )
             wq_resource.wqConfig.sharingScope = scope_value
@@ -634,15 +776,16 @@ class GreenContext:
             resources.append(wq_resource)
 
         desc = _check_cuda_bindings(
-            _drv.cuDevResourceGenerateDesc(  # pyrefly: ignore [missing-attribute]
-                resources, len(resources)
-            )
+            # pyrefly: ignore [missing-attribute]
+            _drv.cuDevResourceGenerateDesc(resources, len(resources))
         )
         green_ctx = _check_cuda_bindings(
-            _drv.cuGreenCtxCreate(  # pyrefly: ignore [missing-attribute]
+            # pyrefly: ignore [missing-attribute]
+            _drv.cuGreenCtxCreate(
                 desc,
-                device,
-                _drv.CUgreenCtxCreate_flags.CU_GREEN_CTX_DEFAULT_STREAM,  # pyrefly: ignore [missing-attribute]
+                drv_device,
+                # pyrefly: ignore [missing-attribute]
+                _drv.CUgreenCtxCreate_flags.CU_GREEN_CTX_DEFAULT_STREAM,
             )
         )
         try:
@@ -650,7 +793,14 @@ class GreenContext:
             context = _check_cuda_bindings(_drv.cuCtxFromGreenCtx(green_ctx))
             if int(context) == 0:
                 raise RuntimeError("Green ctx conversion to regular ctx failed!")
-            self._init_from_cuda_objects(device_id, green_ctx, context)
+            self._init_from_cuda_objects(
+                device_id,
+                green_ctx,
+                context,
+                locality_domain_id,
+                num_locality_domains,
+            )
+            self._is_owning = True
         except Exception:
             # pyrefly: ignore [missing-attribute]
             _check_cuda_bindings(_drv.cuGreenCtxDestroy(green_ctx))
@@ -661,28 +811,51 @@ class GreenContext:
         if green_ctx is None:
             return
 
+        cls = type(self)
+        # retrieve these symbols from the class type instance to avoid
+        # dangling references during interpreter shutdown
+        _check_cuda_bindings = cls._check_cuda_bindings_
+        _drv = cls._drv_
+        if _check_cuda_bindings is None or _drv is None:
+            self._green_ctx = None
+            return
+
         # attempt to destroy streams related to this green context
         # we ignore errors to avoid leaking exceptions during __del__
-        end = min(_STREAMS_PER_GREEN_CONTEXT_POOL, self._curr_stream_idx + 1)
+        end = min(len(self._green_ctx_streams), self._curr_stream_idx + 1)
         for idx in reversed(range(end)):
+            green_ctx_stream = self._green_ctx_streams[idx]
+            if green_ctx_stream is None:
+                continue
             try:
                 # pyrefly: ignore [missing-attribute]
-                _check_cuda_bindings(_drv.cuStreamDestroy(self._green_ctx_streams[idx]))
+                _check_cuda_bindings(_drv.cuStreamDestroy(green_ctx_stream))
             except RuntimeError as e:
                 warnings.warn(
                     f"Error while destroying green context stream at idx {idx} "
                     f"for green context {green_ctx}: {e}"
                 )
         self._green_ctx = None
+        if not self._is_owning:
+            return
         try:
             # pyrefly: ignore [missing-attribute]
             _check_cuda_bindings(_drv.cuGreenCtxDestroy(green_ctx))
         except RuntimeError as e:
             warnings.warn(f"Error while destroying green context {green_ctx}: {e}")
 
-    def _init_from_cuda_objects(self, device_id: int, green_ctx, context) -> None:
+    def _init_from_cuda_objects(
+        self,
+        device_id: int,
+        green_ctx: Any,
+        context: Any,
+        locality_domain_id: int | None,
+        num_locality_domains: int,
+    ) -> None:
         self._device_id = device_id
         self._context = context
+        self._locality_domain_id = locality_domain_id
+        self._num_locality_domains = num_locality_domains
         self._sm_count: int | None = None
         self._parent_stream: torch.cuda.Stream | None = None
         self._green_ctx_streams: list[Any | None] = [
@@ -735,14 +908,6 @@ class GreenContext:
         )
 
     @property
-    def device_id(self) -> int:
-        r"""The device index of this green context."""
-        self._ensure_alive()
-        if self._device_id is None:
-            raise RuntimeError("GreenContext has been destroyed")
-        return self._device_id
-
-    @property
     def sm_partition(self) -> SMPartition:
         r"""The context's actual SM resource, which can be subdivided.
 
@@ -765,14 +930,6 @@ class GreenContext:
             self._sm_count = self.sm_partition.sm_count
         return self._sm_count
 
-    @property
-    def locality_domain_id(self) -> int | None:
-        r"""The locality domain reported by CUDA for this context, if specified.
-
-        Requires CUDA driver and bindings 13.4+.
-        """
-        return self.sm_partition.locality_domain_id
-
     @staticmethod
     def create(
         *,
@@ -780,6 +937,10 @@ class GreenContext:
         sm_partition: SMPartition | None = None,
         workqueue_scope: str | None = None,
         workqueue_concurrency_limit: int | None = None,
+        locality_domain_id: int | None = None,
+        locality_domain_backfill: bool | None = None,
+        locality_domain_remainder: bool | None = None,
+        coscheduled_sm_count: int | None = None,
         device_id: int | None = None,
     ) -> GreenContext:
         r"""Create a CUDA green context.
@@ -791,6 +952,10 @@ class GreenContext:
             sm_partition=sm_partition,
             workqueue_scope=workqueue_scope,
             workqueue_concurrency_limit=workqueue_concurrency_limit,
+            locality_domain_id=locality_domain_id,
+            locality_domain_backfill=locality_domain_backfill,
+            locality_domain_remainder=locality_domain_remainder,
+            coscheduled_sm_count=coscheduled_sm_count,
             device_id=device_id,
         )
 
@@ -803,8 +968,8 @@ class GreenContext:
         resources.
 
         Arguments:
-            device_id (int, optional): The device index to query. When
-                ``None``, the current device is used.
+            device_id (int, optional): The device index to query.
+                When ``None``, the current device is used.
         """
         _ensure_supported()
         _ensure_workqueue_supported()
@@ -812,14 +977,39 @@ class GreenContext:
             device_id = torch.cuda.current_device()
 
         # pyrefly: ignore [missing-attribute]
-        device = _check_cuda_bindings(_drv.cuDeviceGet(device_id))
+        drv_device = _check_cuda_bindings(_drv.cuDeviceGet(device_id))
         wq_resource = _check_cuda_bindings(
-            _drv.cuDeviceGetDevResource(  # pyrefly: ignore [missing-attribute]
-                device,
-                _drv.CUdevResourceType.CU_DEV_RESOURCE_TYPE_WORKQUEUE_CONFIG,  # pyrefly: ignore [missing-attribute]
+            # pyrefly: ignore [missing-attribute]
+            _drv.cuDeviceGetDevResource(
+                drv_device,
+                # pyrefly: ignore [missing-attribute]
+                _drv.CUdevResourceType.CU_DEV_RESOURCE_TYPE_WORKQUEUE_CONFIG,
             )
         )
         return wq_resource.wqConfig.wqConcurrencyLimit
+
+    @property
+    def device_id(self) -> int:
+        self._ensure_alive()
+        device_id = self._device_id
+        if device_id is None:
+            raise RuntimeError("GreenContext has been destroyed")
+        return device_id
+
+    @property
+    def locality_domain_id(self) -> int | None:
+        self._ensure_alive()
+        return self._locality_domain_id
+
+    @property
+    def has_locality_domain(self) -> bool:
+        self._ensure_alive()
+        return self._locality_domain_id is not None and self._locality_domain_id >= 0
+
+    @property
+    def num_locality_domains(self) -> int:
+        self._ensure_alive()
+        return self._num_locality_domains
 
     def _ensure_alive(self) -> None:
         if self._green_ctx is None or self._context is None:
@@ -903,8 +1093,81 @@ class GreenContext:
                     )
                 )
                 self._green_ctx_streams[idx] = green_ctx_stream
+                with _STREAM_TO_GREEN_CTX_LOCK:
+                    _STREAM_TO_GREEN_CTX.setdefault(int(green_ctx_stream), self)
             else:
                 green_ctx_stream = self._green_ctx_streams[idx]
             self._curr_stream_idx = curr_idx
         # pyrefly: ignore [bad-argument-type]
         return torch.cuda.ExternalStream(int(green_ctx_stream), self._device_id)
+
+
+def _get_green_ctx_from_stream(stream: int) -> GreenContext | None:
+    with _STREAM_TO_GREEN_CTX_LOCK:
+        ctx = _STREAM_TO_GREEN_CTX.get(stream)
+    if ctx is not None:
+        return ctx
+    try:
+        # pyrefly: ignore [missing-attribute]
+        drv_ctx = _check_cuda_bindings(_drv.cuStreamGetGreenCtx(stream))
+        if int(drv_ctx) == 0:
+            return None
+        ctx = GreenContext(green_context_obj=drv_ctx)
+        with _STREAM_TO_GREEN_CTX_LOCK:
+            _STREAM_TO_GREEN_CTX.setdefault(stream, ctx)
+        return ctx
+    except RuntimeError:
+        return None
+
+
+def get_green_context_from_stream(stream: torch.cuda.Stream) -> GreenContext | None:
+    return _get_green_ctx_from_stream(stream.cuda_stream)
+
+
+def execute_in_green_contexts(
+    green_ctx_streams: list[torch.cuda.Stream],
+    fn: Callable[[int, GreenContext | None], None],
+) -> None:
+    r"""Execute a function in a list of green context streams in parallel."""
+    if not green_ctx_streams:
+        raise ValueError("Need at least one green context to execute in!")
+    if len(green_ctx_streams) == 1:
+        with torch.cuda.stream(green_ctx_streams[0]):
+            fn(0, get_green_context_from_stream(green_ctx_streams[0]))
+        return
+
+    green_contexts = [
+        get_green_context_from_stream(stream) for stream in green_ctx_streams
+    ]
+    green_events = [torch.cuda.Event() for _ in green_ctx_streams]
+    main_event = torch.cuda.Event()
+    main_stream = torch.cuda.current_stream()
+    main_event.record(main_stream)
+
+    if all(stream.device == main_stream.device for stream in green_ctx_streams):
+        # Avoid restoring the main stream between callbacks. The old sequence
+        # main -> green[0] -> main -> green[1] -> main adds enough host latency
+        # to prevent short kernels from overlapping.
+        try:
+            for i, (green_ctx_stream, green_context, green_event) in enumerate(
+                zip(green_ctx_streams, green_contexts, green_events)
+            ):
+                torch.cuda.set_stream(green_ctx_stream)
+                green_ctx_stream.wait_event(main_event)
+                fn(i, green_context)
+                green_event.record(green_ctx_stream)
+        finally:
+            torch.cuda.set_stream(main_stream)
+    else:
+        # Preserve StreamContext device-switching behavior when a stream is on
+        # a device other than the caller's current device.
+        for i, (green_ctx_stream, green_context, green_event) in enumerate(
+            zip(green_ctx_streams, green_contexts, green_events)
+        ):
+            with torch.cuda.stream(green_ctx_stream):
+                green_ctx_stream.wait_event(main_event)
+                fn(i, green_context)
+                green_event.record(green_ctx_stream)
+
+    for green_event in green_events:
+        main_stream.wait_event(green_event)

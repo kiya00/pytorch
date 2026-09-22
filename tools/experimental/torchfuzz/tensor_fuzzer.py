@@ -373,7 +373,18 @@ def fuzz_tensor(
         # Create base tensor with sufficient storage
         if FuzzerConfig.use_real_values:
             # Use random values based on dtype
-            if dtype.is_floating_point:
+            if dtype in (
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
+                torch.float8_e4m3fnuz,
+                torch.float8_e5m2fnuz,
+            ):
+                # randn has no normal_kernel for fp8 (CPU or CUDA); generate
+                # in bf16 and cast.
+                base_tensor = torch.randn(required_storage, dtype=torch.bfloat16).to(
+                    dtype
+                )
+            elif dtype.is_floating_point:
                 base_tensor = torch.randn(required_storage, dtype=dtype)
             elif dtype in [torch.complex64, torch.complex128]:
                 # Create complex tensor with random real and imaginary parts
