@@ -15728,7 +15728,7 @@ class TestGreenContextStreamPool(TestCase):
         from torch.cuda import green_contexts
 
         ctx = object.__new__(green_contexts.GreenContext)
-        ctx._init_from_cuda_objects(0, 1, 1)
+        ctx._init_from_cuda_objects(0, 1, 1, None, 0)
         creating = threading.Event()
         release = threading.Event()
         requesting = threading.Event()
