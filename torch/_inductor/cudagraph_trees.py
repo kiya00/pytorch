@@ -342,7 +342,7 @@ def register_external_mem_pool(
     same pool again overwrites the prior entry.
 
     Note: registering a pool creates a strong reference! The corresponding
-    ``dereguster_external_mem_pool`` can be used to remove that reference.
+    ``deregister_external_mem_pool`` can be used to remove that reference.
     """
     dev = _mempool_device_index(device)
     _registered_external.setdefault(dev, {})[pool.id] = pool
