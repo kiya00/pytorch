@@ -118,6 +118,13 @@ non-zero cost that can worsen performance on some workloads.
 As a result, localization is likely to speed up some parts of a model and slow
 down others.
 
+#### Localized parameters are read-only
+
+Load, modify or convert weights (`load_state_dict`, in-place updates, `.half()`,
+`.to()`) before calling `torch.cuda.localize`. A localized module or its
+`state_dict()` cannot be saved with `torch.save` or copied with
+`copy.deepcopy`; save or copy the model before localizing it.
+
 #### Numerics change
 
 For linear operations, localization splits output channels. Each branch computes

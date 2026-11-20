@@ -688,7 +688,9 @@ def localize(module: nn.Module) -> nn.Module:
     calling :func:`localize`.  Views and slices of a localized parameter
     (``w[:5]``, ``w.t()``) are copies, so writing through them does not
     change the parameter.  Converting a localized module with ``.half()`` or
-    ``.to()`` is likewise unsupported.
+    ``.to()`` is likewise unsupported.  A localized module or its
+    ``state_dict()`` cannot be saved with :func:`torch.save` or copied with
+    :func:`copy.deepcopy`; save or copy the model before localizing it.
 
     Unregistered module types, and registered ones that are already
     localized, are left alone.  The same ``module`` object is returned for
