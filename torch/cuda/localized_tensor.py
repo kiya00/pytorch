@@ -616,11 +616,7 @@ def _localization_supported_or_warn(device: int) -> bool:
     return False
 
 
-def _localize_tensor(
-    tensor: torch.Tensor,
-    *,
-    mark_static_halves: bool = True,
-) -> _LocalizedTensor:
+def _localize_tensor(tensor: torch.Tensor) -> _LocalizedTensor:
     """Internal: split a single tensor across locality domains.
 
     Used by :func:`localize` for each localizable layer's parameters.
@@ -635,13 +631,6 @@ def _localize_tensor(
 
     Everything is localized onto ``tensor``'s own device; splitting a tensor
     across some other device's locality domains would mean moving it there.
-
-    When ``mark_static_halves`` is True (the default) each half is tagged with
-    :func:`torch._dynamo.mark_static_address` before being wrapped.  The halves
-    live in our LocalizationContext mempools, so their data pointers are stable
-    across iterations by construction; marking them static lets cudagraph_trees
-    skip the per-iter ``_foreach_copy_`` it would otherwise emit for non-static
-    graph inputs.
     """
     device = tensor.device.index
     ctx = _LocalizationContext.for_device(device)
@@ -662,15 +651,6 @@ def _localize_tensor(
             half.copy_(slice_)
         half.requires_grad_(tensor.requires_grad)
         halves.append(half)
-
-    if mark_static_halves:
-        # Import lazily: torch._dynamo isn't necessarily importable at
-        # torch.cuda module-import time, but is always available by the
-        # time anyone calls localize().
-        from torch._dynamo.decorators import mark_static_address
-
-        for half in halves:
-            mark_static_address(half)
 
     return _LocalizedTensor(halves, ctx)
 
@@ -705,7 +685,6 @@ def localize(
     module: nn.Module,
     *,
     num_partitions: int | None = None,
-    mark_static_halves: bool = True,
 ) -> nn.Module:
     r"""Localize every localizable layer in ``module``'s tree (recursive, in place).
 
@@ -771,14 +750,6 @@ def localize(
             :func:`torch.cuda.green_contexts.get_num_locality_domains`).
             Currently only two domains are supported; this argument can be
             omitted to query the count automatically.
-        mark_static_halves: when True (default), each per-domain
-            half of every localized weight/bias is tagged with
-            :func:`torch._dynamo.mark_static_address`.  The halves live
-            in green-context-pinned mempools so their addresses are
-            stable across iterations; marking them static lets
-            cudagraph_trees skip the per-iter ``_foreach_copy_`` it
-            would otherwise emit.  Set to ``False`` to leave the halves
-            unmarked.
 
     If a parameter's device does not support green-context localization
     (hardware without locality domains, or a driver older than CUDA
@@ -820,18 +791,7 @@ def localize(
     _register_default_localizable_ops()
 
     def _swap_to_localized(p: torch.Tensor) -> None:
-        # We mark static halves *after* the Parameter wrap + swap below.
-        # nn.Parameter(_LocalizedTensor) detach()s its input, which
-        # rebuilds the wrapper via its __torch_dispatch__ detach handler:
-        # the new halves share storage with the original ones but are fresh Python
-        # objects, so any ``_dynamo_static_input_type`` attribute set on
-        # the originals would be lost.  Pass ``mark_static_halves=False``
-        # to ``_localize_tensor`` here and re-apply the mark on
-        # ``p._halves`` after swap_tensors, which are the final ones.
-        new = nn.Parameter(
-            _localize_tensor(p, mark_static_halves=False),
-            requires_grad=p.requires_grad,
-        )
+        new = nn.Parameter(_localize_tensor(p), requires_grad=p.requires_grad)
         # swap_tensors poisons the AccumulateGrad node attached to the
         # original parameter (see torch.utils.swap_tensors); clearing
         # ``p.grad`` first avoids that diagnostic.  Localization is
@@ -858,17 +818,12 @@ def localize(
         # not about this bookkeeping.
         with torch.inference_mode(False):
             torch.utils.swap_tensors(p, new)
-        # Same reason the static marks are re-applied here: the Parameter
-        # wrap detached and rebuilt the halves, dropping the flag
+        # nn.Parameter(_LocalizedTensor) detach()s its input, which rebuilds
+        # the halves as fresh tensors and drops the autograd flag
         # _localize_tensor set on the originals.  These are the halves the
-        # localized ops will read, so the flag has to land on them.
+        # localized ops read, so the flag has to land on them.
         for half in p._halves:  # type: ignore[attr-defined]
             half.requires_grad_(p.requires_grad)
-        if mark_static_halves:
-            from torch._dynamo.decorators import mark_static_address
-
-            for half in p._halves:  # type: ignore[attr-defined]
-                mark_static_address(half)
 
     # Module types some registered op declared, and the parameters to rewrite
     # on each: the op's localized positions, named.  For F.linear those are

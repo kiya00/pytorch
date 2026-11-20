@@ -498,56 +498,6 @@ class TestLocalizeContract(TestCase):
                 torch.cuda.localize(m)
         self.assertFalse(_is_localized_tensor(m[0].weight))
 
-    @_requires_green_contexts
-    def test_mark_static_halves_default_marks_halves(self):
-        """By default, ``torch.cuda.localize`` marks each per-domain
-        half of every localized weight/bias with
-        ``mark_static_address``.  Cudagraph_trees then knows the halves'
-        data pointers are stable across iters and can skip the per-iter
-        copy it would otherwise emit for non-static inputs.
-
-        Implementation note: the mark has to be applied *after*
-        ``swap_tensors``.  ``nn.Parameter(_LocalizedTensor)`` detach()es
-        its input, which rebuilds the halves via
-        ``__tensor_unflatten__`` as fresh Python objects (same storage).
-        Marking pre-Parameter would silently get dropped, hence this
-        test.
-        """
-        m = _OneLinear(64, 128, bias=True).cuda()
-        with torch.inference_mode():
-            torch.cuda.localize(m)  # default: mark_static_halves=True
-        w = m.fc.weight
-        b = m.fc.bias
-        self.assertEqual(
-            getattr(w._half0, "_dynamo_static_input_type", None),
-            "unguarded",
-        )
-        self.assertEqual(
-            getattr(w._half1, "_dynamo_static_input_type", None),
-            "unguarded",
-        )
-        self.assertEqual(
-            getattr(b._half0, "_dynamo_static_input_type", None),
-            "unguarded",
-        )
-        self.assertEqual(
-            getattr(b._half1, "_dynamo_static_input_type", None),
-            "unguarded",
-        )
-
-    @_requires_green_contexts
-    def test_mark_static_halves_false_leaves_halves_unmarked(self):
-        """``mark_static_halves=False`` must leave the halves unmarked."""
-        m = _OneLinear(64, 128, bias=True).cuda()
-        with torch.inference_mode():
-            torch.cuda.localize(m, mark_static_halves=False)
-        w = m.fc.weight
-        b = m.fc.bias
-        self.assertIsNone(getattr(w._half0, "_dynamo_static_input_type", None))
-        self.assertIsNone(getattr(w._half1, "_dynamo_static_input_type", None))
-        self.assertIsNone(getattr(b._half0, "_dynamo_static_input_type", None))
-        self.assertIsNone(getattr(b._half1, "_dynamo_static_input_type", None))
-
     def test_is_localization_supported_is_total(self):
         """The capability predicate must return a bool -- never raise --
         on any hardware/driver combination, since it is exactly the guard
