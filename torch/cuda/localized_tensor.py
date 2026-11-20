@@ -404,9 +404,10 @@ class _LocalizedTensor(torch.Tensor):
                 halves = tuple(h.detach() for h in inp._halves)
                 return _LocalizedTensor(halves, inp._ctx)
 
-        for schema_arg, value in zip(op._schema.arguments, args):
+        for i, schema_arg in enumerate(op._schema.arguments):
             alias_info = schema_arg.alias_info
             if alias_info is not None and alias_info.is_write:
+                value = args[i] if i < len(args) else kwargs.get(schema_arg.name)
                 if any(
                     isinstance(t, _LocalizedTensor)
                     for t in (value if isinstance(value, (list, tuple)) else (value,))
@@ -750,10 +751,12 @@ def localize(
     produce correct results.
 
     Localized parameters are read-only: in-place updates (``copy_``,
-    ``load_state_dict``, ``nn.init``, optimizer steps) raise
-    :class:`NotImplementedError` instead of silently doing nothing.  Load
-    or modify weights before calling :func:`localize`.  Converting a
-    localized module with ``.half()`` or ``.to()`` is likewise unsupported.
+    ``load_state_dict``, ``nn.init``, optimizer steps, ``out=``) raise an
+    error instead of silently doing nothing.  Load or modify weights before
+    calling :func:`localize`.  Views and slices of a localized parameter
+    (``w[:5]``, ``w.t()``) are copies, so writing through them does not
+    change the parameter.  Converting a localized module with ``.half()`` or
+    ``.to()`` is likewise unsupported.
 
     Unregistered module types, and registered ones that are already
     localized, are left alone.  The same ``module`` object is returned for

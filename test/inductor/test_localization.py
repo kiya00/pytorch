@@ -445,6 +445,8 @@ class TestLocalizeContract(TestCase):
                 m.load_state_dict(sd)
             with self.assertRaisesRegex(NotImplementedError, "in place"):
                 torch._foreach_add_([m.fc.weight], 1.0)
+            with self.assertRaisesRegex(NotImplementedError, "in place"):
+                torch.mul(torch.ones(128, 64, device="cuda"), 0, out=m.fc.weight)
             m(torch.randn(4, 64, device="cuda"))
 
     @_requires_green_contexts
