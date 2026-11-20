@@ -565,7 +565,6 @@ class _LocalizedTensor(torch.Tensor):
                 else:
                     per_branch_kwargs[keyword] = per_branch[b]
 
-            # Stream contexts supply Dynamo's per-branch stream metadata to Inductor.
             with torch.cuda.stream(stream):
                 stream.wait_event(primary._default_event)
                 with torch.cuda.use_mem_pool(

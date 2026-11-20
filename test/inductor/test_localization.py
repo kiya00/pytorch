@@ -416,10 +416,6 @@ class TestLocalizeContract(TestCase):
 
     hw_classification = HardwareClassification.CUDA
 
-    def setUp(self):
-        super().setUp()
-        torch._dynamo.reset()
-
     @_requires_green_contexts
     def test_localize_replaces_linear_weight_with_subclass(self):
         """nn.Linear.weight should become a _LocalizedTensor after localize."""
@@ -552,10 +548,6 @@ class TestLocalizableOpRegistry(TestCase):
 
     hw_classification = HardwareClassification.CUDA
 
-    def setUp(self):
-        super().setUp()
-        torch._dynamo.reset()
-
     @_requires_green_contexts
     def test_linear_is_registered_not_special_cased(self):
         """F.linear is an ordinary registry entry, carrying the arg names
@@ -637,7 +629,6 @@ class TestLocalizableOpRegistryCustomOp(TestCase):
 
     def setUp(self):
         super().setUp()
-        torch._dynamo.reset()
         from torch.cuda.localized_tensor import (
             _LOCALIZABLE_OPS,
             _register_localizable_op,
@@ -750,7 +741,6 @@ class TestLocalizableOpSlicedArgs(TestCase):
 
     def setUp(self):
         super().setUp()
-        torch._dynamo.reset()
         from torch.cuda.localized_tensor import _LOCALIZABLE_OPS
 
         stack = contextlib.ExitStack()
@@ -873,10 +863,6 @@ class TestLocalizationRuntimeNumerics(TestCase):
 
     hw_classification = HardwareClassification.CUDA
 
-    def setUp(self):
-        super().setUp()
-        torch._dynamo.reset()
-
     @_requires_green_contexts
     def test_basic_linear(self):
         x = torch.randn(32, 64, device="cuda")
@@ -952,10 +938,6 @@ class TestLocalizationRuntimeNumerics(TestCase):
 class TestLocalizationChainNumerics(TestCase):
     hw_classification = HardwareClassification.CUDA
 
-    def setUp(self):
-        super().setUp()
-        torch._dynamo.reset()
-
     @_requires_green_contexts
     def test_chain_2(self):
         x = torch.randn(32, 64, device="cuda")
@@ -1024,10 +1006,6 @@ class TestLocalizationChainNumerics(TestCase):
 
 class TestLocalizationPackingNumerics(TestCase):
     hw_classification = HardwareClassification.CUDA
-
-    def setUp(self):
-        super().setUp()
-        torch._dynamo.reset()
 
     @_requires_green_contexts
     def test_linear_with_bias(self):
@@ -1143,10 +1121,6 @@ class TestLocalizationPackingNumerics(TestCase):
 class TestLocalizationSharedWeight(TestCase):
     hw_classification = HardwareClassification.CUDA
 
-    def setUp(self):
-        super().setUp()
-        torch._dynamo.reset()
-
     @_requires_green_contexts
     def test_linear_called_twice(self):
         """One nn.Linear, two inputs.  The same _LocalizedTensor weight is
@@ -1194,10 +1168,6 @@ class TestLocalizationSharedWeight(TestCase):
 class TestLocalizationDtypes(TestCase):
     hw_classification = HardwareClassification.CUDA
 
-    def setUp(self):
-        super().setUp()
-        torch._dynamo.reset()
-
     @_requires_green_contexts
     @_requires_cublas_tensorop_on_green_streams
     def test_dtype_float16(self):
@@ -1227,10 +1197,6 @@ class TestLocalizationRequiresInferenceMode(TestCase):
     """
 
     hw_classification = HardwareClassification.CUDA
-
-    def setUp(self):
-        super().setUp()
-        torch._dynamo.reset()
 
     @_requires_green_contexts
     def test_module_path_raises_outside_inference_mode(self):
