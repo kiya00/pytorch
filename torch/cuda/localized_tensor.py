@@ -643,13 +643,7 @@ def _localize_tensor(tensor: torch.Tensor) -> _LocalizedTensor:
     for slice_, pool in zip(slices, ctx.weight_pools):
         with torch.cuda.use_mem_pool(pool, device=device):
             half = torch.empty_like(slice_)
-        # Fill under no_grad so the copy does not make the half a non-leaf
-        # view of the source, then take the source's autograd flag: the
-        # halves are what every localized op actually reads, so a parameter
-        # that requires grad has to have halves that require it too.
-        with torch.no_grad():
-            half.copy_(slice_)
-        half.requires_grad_(tensor.requires_grad)
+        half.copy_(slice_)
         halves.append(half)
 
     return _LocalizedTensor(halves, ctx)
@@ -812,12 +806,6 @@ def localize(module: nn.Module) -> nn.Module:
         # not about this bookkeeping.
         with torch.inference_mode(False):
             torch.utils.swap_tensors(p, new)
-        # nn.Parameter(_LocalizedTensor) detach()s its input, which rebuilds
-        # the halves as fresh tensors and drops the autograd flag
-        # _localize_tensor set on the originals.  These are the halves the
-        # localized ops read, so the flag has to land on them.
-        for half in p._halves:  # type: ignore[attr-defined]
-            half.requires_grad_(p.requires_grad)
 
     # Module types some registered op declared, and the parameters to rewrite
     # on each: the op's localized positions, named.  For F.linear those are
