@@ -4868,7 +4868,7 @@ class NcclUserBufferRegistrationTest(MultiProcessTestCase):
 
 
 class CudagraphNcclMemPoolTest(MultiProcessTestCase):
-    """A MemPool backed by NCCL's allocator can be registered with cudagraph_trees
+    """A MemPool registered with NCCL can also be registered with cudagraph_trees,
     so a cudagraph-captured region can produce NCCL-registered ("userbuffer")
     buffers, which collectives then use directly."""
 
@@ -4899,7 +4899,6 @@ class CudagraphNcclMemPoolTest(MultiProcessTestCase):
     @requires_nccl_version((2, 19), "Need NCCL 2.19 for user buffer registration")
     @skip_if_lt_x_gpu(1)
     def test_cudagraph_registered_nccl_mempool(self):
-        from torch._inductor import config as inductor_config
         from torch._inductor.cudagraph_trees import (
             deregister_external_mem_pool,
             get_container,
@@ -4930,37 +4929,28 @@ class CudagraphNcclMemPoolTest(MultiProcessTestCase):
         backend.register_mem_pool(pool)
         register_external_mem_pool(pool, device=device)
 
-        out = None
+        def step(pool, x):
+            with torch.cuda.use_mem_pool(pool):
+                return x + 1
+
         try:
-            with inductor_config.patch(
-                {"triton.cudagraphs": True, "triton.cudagraph_trees": True}
-            ):
+            step_opt = torch.compile(step, mode="reduce-overhead", fullgraph=True)
+            expected = float(sum(r + 2 for r in range(self.world_size)))
+            for _ in range(3):
+                torch.compiler.cudagraph_mark_step_begin()
+                x = torch.full((1024,), float(self.rank + 1), device=device)
+                # out lives in the NCCL-registered pool and is produced by the
+                # cudagraph; the collective uses it directly (userbuffer).
+                out = step_opt(pool, x)
+                dist.all_reduce(out)
+                torch.cuda.synchronize(device)
+                self.assertEqual(out, torch.full((1024,), expected, device=device))
 
-                def step(pool, x):
-                    with torch.cuda.use_mem_pool(pool):
-                        return x + 1
-
-                step_opt = torch.compile(step, mode="reduce-overhead", fullgraph=True)
-                expected = float(sum(r + 2 for r in range(self.world_size)))
-                for _ in range(3):
-                    torch.compiler.cudagraph_mark_step_begin()
-                    x = torch.full((1024,), float(self.rank + 1), device=device)
-                    # out lives in the NCCL-registered pool and is produced by
-                    # the cudagraph; the collective uses it directly (userbuffer).
-                    out = step_opt(pool, x)
-                    dist.all_reduce(out)
-                    torch.cuda.synchronize(device)
-                    self.assertEqual(out, torch.full((1024,), expected, device=device))
-
-                # The registered pool did not disable cudagraphs: a cudagraph
-                # tree manager recorded on this device.
-                self.assertIsNotNone(get_container(device.index).tree_manager)
+            # The registered pool did not disable cudagraphs.
+            self.assertIsNotNone(get_container(device.index).tree_manager)
         finally:
-            out = None
             deregister_external_mem_pool(pool, device=device)
             backend.deregister_mem_pool(pool)
-            del pool
-            torch.cuda.empty_cache()
 
 
 class CommTest(test_c10d_common.AbstractCommTest, MultiProcessTestCase):
