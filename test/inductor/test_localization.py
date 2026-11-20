@@ -472,9 +472,13 @@ class TestLocalizeContract(TestCase):
         from torch.nn.utils.parametrizations import weight_norm
 
         with torch.inference_mode():
-            lin = weight_norm(nn.Linear(8, 8, device="cuda"))
+            m = nn.Sequential(
+                nn.Linear(8, 8, device="cuda"),
+                weight_norm(nn.Linear(8, 8, device="cuda")),
+            )
             with self.assertRaisesRegex(NotImplementedError, "parametrized weight"):
-                torch.cuda.localize(lin)
+                torch.cuda.localize(m)
+        self.assertFalse(_is_localized_tensor(m[0].weight))
 
     def test_rejects_graph_module(self):
         gm = torch.fx.symbolic_trace(_OneLinear(64, 128))
@@ -487,11 +491,12 @@ class TestLocalizeContract(TestCase):
     @_requires_green_contexts
     def test_rejects_odd_output_dim(self):
         """Splitting an odd output dim must error rather than silently
-        miscompute."""
-        m = _OneLinear(16, 17).cuda()
+        miscompute, before any layer is localized."""
+        m = nn.Sequential(nn.Linear(16, 16), nn.Linear(16, 17)).cuda()
         with self.assertRaisesRegex(ValueError, "divisible"):
             with torch.inference_mode():
                 torch.cuda.localize(m)
+        self.assertFalse(_is_localized_tensor(m[0].weight))
 
     @_requires_green_contexts
     def test_mark_static_halves_default_marks_halves(self):
@@ -578,6 +583,7 @@ class TestLocalizeContract(TestCase):
         self.assertFalse(_is_localized_tensor(m.fc.bias))
         relevant = [w for w in caught if "localization" in str(w.message)]
         self.assertEqual(len(relevant), 1)
+        self.assertEqual(relevant[0].filename, __file__)
         # The unlocalized module must still work.
         x = torch.randn(4, 64, device="cuda")
         y = m(x)

@@ -594,7 +594,7 @@ class _LocalizedTensor(torch.Tensor):
         return result
 
 
-def _localization_supported_or_warn(device: int, *, stacklevel: int = 4) -> bool:
+def _localization_supported_or_warn(device: int) -> bool:
     """True if ``device`` supports green-context localization; otherwise
     warn (once per process per device) and return False so
     :func:`localize` can skip the parameter instead of raising."""
@@ -611,7 +611,7 @@ def _localization_supported_or_warn(device: int, *, stacklevel: int = 4) -> bool
         f"CUDA device {device} does not support green-context "
         "localization (requires a CUDA 13.4+ driver and hardware with "
         ">= 2 locality domains); skipping localization.",
-        stacklevel=stacklevel,
+        stacklevel=3,
     )
     return False
 
@@ -619,7 +619,6 @@ def _localization_supported_or_warn(device: int, *, stacklevel: int = 4) -> bool
 def _localize_tensor(
     tensor: torch.Tensor,
     *,
-    num_partitions: int | None = None,
     mark_static_halves: bool = True,
 ) -> _LocalizedTensor:
     """Internal: split a single tensor across locality domains.
@@ -630,8 +629,9 @@ def _localize_tensor(
     :func:`localize` (which walks an ``nn.Module`` tree) instead of invoking
     this directly.
 
-    If ``num_partitions`` is ``None``, the tensor is divided into one partition
-    per locality domain of the device.
+    The tensor is divided into one partition per locality domain of its
+    device; :func:`localize` has already checked that ``tensor.shape[0]`` is
+    divisible by that count.
 
     Everything is localized onto ``tensor``'s own device; splitting a tensor
     across some other device's locality domains would mean moving it there.
@@ -643,29 +643,13 @@ def _localize_tensor(
     skip the per-iter ``_foreach_copy_`` it would otherwise emit for non-static
     graph inputs.
     """
-    if not tensor.is_cuda:
-        raise ValueError(f"localize requires a CUDA tensor; got device={tensor.device}")
-
     device = tensor.device.index
-    if num_partitions is None:
-        num_partitions = torch.cuda.green_contexts.get_num_locality_domains(device)
-
-    if tensor.shape[0] % num_partitions != 0:
-        raise ValueError(
-            f"tensor.shape[0] ({tensor.shape[0]}) must be divisible by "
-            f"num_partitions ({num_partitions})"
-        )
-
     ctx = _LocalizationContext.for_device(device)
-    if num_partitions != ctx.num_partitions:
-        raise NotImplementedError(
-            f"only {ctx.num_partitions}-way splits supported on device {device}"
-        )
 
     # Slice the source and copy each piece into the matching mempool so
     # the half lives in the locality-domain-local HBM the matmul will
     # read from.
-    slices = list(torch.tensor_split(tensor, num_partitions, dim=0))
+    slices = list(torch.tensor_split(tensor, ctx.num_partitions, dim=0))
     halves: list[torch.Tensor] = []
     for slice_, pool in zip(slices, ctx.weight_pools):
         with torch.cuda.use_mem_pool(pool, device=device):
@@ -782,8 +766,8 @@ def localize(
         module: the module (or model) to walk. Mutated in place.
             :class:`torch.fx.GraphModule` instances, including nested
             GraphModules, are not supported.
-        num_partitions: forwarded to the per-tensor splitter.  Defaults
-            to the device's locality-domain count (see
+        num_partitions: number of parts each parameter is split into.  Must
+            equal the device's locality-domain count, which is the default (see
             :func:`torch.cuda.green_contexts.get_num_locality_domains`).
             Currently only two domains are supported; this argument can be
             omitted to query the count automatically.
@@ -835,22 +819,7 @@ def localize(
 
     _register_default_localizable_ops()
 
-    # Track the Python objects we've already visited, keyed by id().  Holds
-    # both params we swapped and params we skipped (unsupported / not on
-    # CUDA), so a tied parameter (one Parameter held by multiple modules)
-    # is only processed once -- swap_tensors mutates the underlying Python
-    # object in place, so every alias observes the result automatically.
-    visited: set[int] = set()
-
     def _swap_to_localized(p: torch.Tensor) -> None:
-        if id(p) in visited:
-            return
-        if isinstance(p, _LocalizedTensor) or not p.is_cuda:
-            visited.add(id(p))
-            return
-        if not _localization_supported_or_warn(p.device.index):
-            visited.add(id(p))
-            return
         # We mark static halves *after* the Parameter wrap + swap below.
         # nn.Parameter(_LocalizedTensor) detach()s its input, which
         # rebuilds the wrapper via its __torch_dispatch__ detach handler:
@@ -860,11 +829,7 @@ def localize(
         # to ``_localize_tensor`` here and re-apply the mark on
         # ``p._halves`` after swap_tensors, which are the final ones.
         new = nn.Parameter(
-            _localize_tensor(
-                p,
-                num_partitions=num_partitions,
-                mark_static_halves=False,
-            ),
+            _localize_tensor(p, mark_static_halves=False),
             requires_grad=p.requires_grad,
         )
         # swap_tensors poisons the AccumulateGrad node attached to the
@@ -904,7 +869,6 @@ def localize(
 
             for half in p._halves:  # type: ignore[attr-defined]
                 mark_static_address(half)
-        visited.add(id(p))
 
     # Module types some registered op declared, and the parameters to rewrite
     # on each: the op's localized positions, named.  For F.linear those are
@@ -915,6 +879,10 @@ def localize(
         if meta.module_type is not None
     ]
 
+    # Parameters to localize, keyed by id() so a tied parameter held by several
+    # modules is swapped once; swap_tensors mutates the shared object in place,
+    # so every holder observes the result.
+    targets: dict[int, torch.Tensor] = {}
     for child in module.modules():
         for module_type, param_names in localizable_modules:
             if not isinstance(child, module_type):
@@ -935,7 +903,32 @@ def localize(
                     )
             for name in param_names:
                 p = getattr(child, name, None)
-                if p is not None:
-                    _swap_to_localized(p)
+                if p is not None and p.is_cuda and not isinstance(p, _LocalizedTensor):
+                    targets[id(p)] = p
             break
+
+    # Validate every target before swapping any, so a rejected layer leaves the
+    # module untouched.
+    from torch.cuda.green_contexts import get_num_locality_domains
+
+    to_swap = []
+    for p in targets.values():
+        device = p.device.index
+        if not _localization_supported_or_warn(device):
+            continue
+        num_domains = get_num_locality_domains(device)
+        n = num_domains if num_partitions is None else num_partitions
+        if p.shape[0] % n != 0:
+            raise ValueError(
+                f"tensor.shape[0] ({p.shape[0]}) must be divisible by "
+                f"num_partitions ({n})"
+            )
+        if n != num_domains:
+            raise NotImplementedError(
+                f"only {num_domains}-way splits supported on device {device}"
+            )
+        to_swap.append(p)
+
+    for p in to_swap:
+        _swap_to_localized(p)
     return module
