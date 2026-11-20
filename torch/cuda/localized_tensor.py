@@ -67,21 +67,14 @@ class _StreamSet:
 
 
 class _LocalizationContext:
-    """Per-device handle bundling the green contexts and locality-domain
-    mempools that ``_LocalizedTensor`` instances on a device share.
+    """Per-device green contexts and locality-domain mempools shared by every
+    ``_LocalizedTensor`` on the device.
 
-    Heavyweight: each ``GreenContext`` claims an SM partition and each
-    ``MemPool`` reserves caching-allocator state. Create
-    one per device and reuse it across all LocalizedTensors on that device.
-    ``_LocalizationContext.for_device(...)`` returns a cached instance per
-    device.
-
-    Do not use this context to cache data: it is intended to outlive
-    individual tensors.
-
-    Each ``_LocalizedTensor`` owns its fork/join events. Stream handles come
-    from each green context's round-robin pool, so different tensors may use
-    the same underlying CUDA stream.
+    Green contexts and pools are heavyweight, so ``for_device`` caches one
+    instance per device for the life of the process.  Each
+    ``_LocalizedTensor`` owns its fork/join events; stream handles come from
+    each green context's round-robin pool, so different tensors may share a
+    CUDA stream.
     """
 
     def __init__(
@@ -279,8 +272,7 @@ class _LocalizedTensor(torch.Tensor):
     The halves are plain ``torch.Tensor`` objects allocated in different
     ``MemPool``s. ``__torch_function__`` runs the ops registered
     in :data:`_LOCALIZABLE_OPS` as parallel branches on green-context-backed
-    streams and concatenates the results. Concatenation always happens along
-    dimension -1.
+    streams and concatenates the results.
     """
 
     @staticmethod
@@ -400,9 +392,8 @@ class _LocalizedTensor(torch.Tensor):
         # gets its own stream set.
         if op is torch.ops.aten.detach.default:
             (inp,) = args
-            if isinstance(inp, _LocalizedTensor):
-                halves = tuple(h.detach() for h in inp._halves)
-                return _LocalizedTensor(halves, inp._ctx)
+            halves = tuple(h.detach() for h in inp._halves)
+            return _LocalizedTensor(halves, inp._ctx)
 
         for i, schema_arg in enumerate(op._schema.arguments):
             alias_info = schema_arg.alias_info
@@ -617,20 +608,11 @@ def _localization_supported_or_warn(device: int) -> bool:
 
 
 def _localize_tensor(tensor: torch.Tensor) -> _LocalizedTensor:
-    """Internal: split a single tensor across locality domains.
+    """Split ``tensor`` along ``dim 0`` into one half per locality domain of
+    its own device, each copied into that domain's weight pool.
 
-    Used by :func:`localize` for each localizable layer's parameters.
-    Returns a :class:`_LocalizedTensor` whose halves are allocated in
-    per-locality-domain mempools.  Public callers should use
-    :func:`localize` (which walks an ``nn.Module`` tree) instead of invoking
-    this directly.
-
-    The tensor is divided into one partition per locality domain of its
-    device; :func:`localize` has already checked that ``tensor.shape[0]`` is
-    divisible by that count.
-
-    Everything is localized onto ``tensor``'s own device; splitting a tensor
-    across some other device's locality domains would mean moving it there.
+    :func:`localize` has already checked that ``tensor.shape[0]`` is
+    divisible by the domain count.
     """
     device = tensor.device.index
     ctx = _LocalizationContext.for_device(device)
@@ -692,17 +674,9 @@ def localize(module: nn.Module) -> nn.Module:
     :func:`torch.cuda.green_contexts.get_num_locality_domains`); currently
     only two domains are supported.
 
-    The swap is done with :func:`torch.utils.swap_tensors`, which flips
-    the parameter's ``__class__`` / ``__dict__`` / slots and the
-    underlying ``at::Tensor`` pointer in place.  This means:
-
-      * Python identity is preserved -- any reference captured before
-        the call (e.g. ``w = model.fc.weight``) resolves to the
-        localized parameter afterward.
-      * Tied parameters are preserved automatically: a Parameter held
-        by two modules (``head.weight = embed.weight``) is a single
-        Python object, so the in-place swap is observed by both holders
-        without an extra alias-walk.
+    Parameters are swapped in place with :func:`torch.utils.swap_tensors`,
+    so references taken before the call (``w = model.fc.weight``) and tied
+    parameters (``head.weight = embed.weight``) see the localized parameter.
 
     Unlocalizable holders of a tied weight (such as ``nn.Embedding``) will
     reify the full tensor on each forward via the slow concat path, but

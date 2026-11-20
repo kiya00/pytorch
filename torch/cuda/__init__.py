@@ -41,6 +41,7 @@ from .graphs import (
     make_graphed_callables,
 )
 from .green_contexts import GreenContext
+from .localized_tensor import localize
 from .streams import Event, execute_on_streams, ExternalStream, Stream
 
 
@@ -1613,9 +1614,6 @@ def _get_amdsmi_device_index(device: Device) -> int:
         return idx_map[idx]
     else:
         return _get_amdsmi_device_index_from_hip_index(idx_map[idx])
-
-
-from .localized_tensor import localize
 
 
 def _get_amdsmi_device_memory_used(device: Device = None) -> int:
