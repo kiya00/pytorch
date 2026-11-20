@@ -617,7 +617,11 @@ def _register_default_localizable_ops() -> None:
         _register_localizable_op(torch.ops.aten.linear.default, localized_args=(1, 2))
 
 
-def localize(module: nn.Module) -> nn.Module:
+def localize(
+    module: nn.Module,
+    *,
+    mark_static_halves: bool = True,
+) -> nn.Module:
     r"""Localize every localizable layer in ``module``'s tree (recursive, in place).
 
     A layer is localizable when its type was registered as some op's
@@ -675,6 +679,14 @@ def localize(module: nn.Module) -> nn.Module:
         module: the module (or model) to walk. Mutated in place.
             :class:`torch.fx.GraphModule` instances, including nested
             GraphModules, are not supported.
+        mark_static_halves: when True (default), each per-domain
+            half of every localized weight/bias is tagged with
+            :func:`torch._dynamo.mark_static_address`.  The halves live
+            in green-context-pinned mempools so their addresses are
+            stable across iterations; marking them static lets
+            cudagraph_trees skip the per-iter ``_foreach_copy_`` it
+            would otherwise emit.  Set to ``False`` to leave the halves
+            unmarked.
 
     If a parameter's device does not support green-context localization
     (hardware without locality domains, or a driver older than CUDA
@@ -743,6 +755,14 @@ def localize(module: nn.Module) -> nn.Module:
         # not about this bookkeeping.
         with torch.inference_mode(False):
             torch.utils.swap_tensors(p, new)
+        # nn.Parameter(_LocalizedTensor) detach()s its input, which rebuilds
+        # the halves as fresh tensors, so a tag set before the wrap would be
+        # lost: mark the final halves.
+        if mark_static_halves:
+            from torch._dynamo.decorators import mark_static_address
+
+            for half in p._halves:  # type: ignore[attr-defined]
+                mark_static_address(half)
 
     # Module types some registered op declared, and the parameters to rewrite
     # on each: the op's localized positions, named.  For F.linear those are
