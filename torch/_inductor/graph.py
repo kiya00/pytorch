@@ -2010,10 +2010,10 @@ class GraphLowering(torch.fx.Interpreter):
         managed (tracked/checkpointed) by cudagraph_trees like the private capture
         pool, so cudagraph capture need not be disabled for it.
         """
-        mempool_index, mempool_device = node_mempool
         from torch._dynamo.graph_bytecode_inputs import get_external_object_by_index
         from torch._inductor.cudagraph_trees import is_registered_external
 
+        mempool_index, mempool_device = node_mempool
         pool = cast(torch.cuda.MemPool, get_external_object_by_index(mempool_index))
         return is_registered_external(mempool_device, pool.id)
 
@@ -2097,11 +2097,8 @@ class GraphLowering(torch.fx.Interpreter):
             and self.disable_cudagraphs_reason is None
             and not self._mempool_is_cudagraph_managed(node_mempool)
         ):
-            # A user MemPool routes allocations to an explicit pool rather than the
-            # cudagraph private capture pool. Unless that pool is registered with
-            # cudagraph_trees (which then manages/checkpoints it like the private
-            # pool), capture would violate that routing and trip cudagraph
-            # memory-pool assertions.
+            # Capture allocates from the private pool, which breaks routing to an
+            # explicit user pool unless that pool is registered with cudagraph_trees.
             self.disable_cudagraphs_reason = (
                 "user CUDA MemPool contexts are not compatible with CUDA graphs"
             )

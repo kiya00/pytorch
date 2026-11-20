@@ -88,6 +88,7 @@ from torch._inductor.cudagraph_utils import (
     WrappedFunction,
 )
 from torch._library.opaque_object import is_custom_class_obj
+from torch.cuda._utils import _get_device_index
 from torch.multiprocessing.reductions import StorageWeakRef
 from torch.storage import UntypedStorage
 from torch.utils import _pytree as pytree
@@ -318,17 +319,9 @@ def mark_warmup_incomplete() -> None:
         manager.mark_warmup_incomplete()
 
 
-# Registry of externally-managed CUDA MemPools that are tracked.
-# Keyed by device index -> {pool_id: MemPool}; holds pools alive while registered.
+# Per-device registry of external MemPools that cudagraph_trees manages; holds the
+# pools alive. Keyed by device index -> {pool_id: MemPool}.
 _registered_external: dict[int, dict[tuple[int, int], torch.cuda.MemPool]] = {}
-
-
-def _mempool_device_index(device: int | torch.device | None) -> int:
-    if device is None:
-        return torch.cuda.current_device()
-    if isinstance(device, torch.device):
-        return device.index if device.index is not None else torch.cuda.current_device()
-    return device
 
 
 def register_external_mem_pool(
@@ -339,28 +332,23 @@ def register_external_mem_pool(
 
     Allocations from a registered pool made inside a cudagraph-captured region are
     tracked and checkpointed instead of being reported as leaks. Registering the
-    same pool again overwrites the prior entry.
-
-    Note: registering a pool creates a strong reference! The corresponding
-    ``deregister_external_mem_pool`` can be used to remove that reference.
+    same pool again overwrites the prior entry. The registry holds a strong
+    reference to ``pool`` until ``deregister_external_mem_pool`` is called.
     """
-    dev = _mempool_device_index(device)
+    dev = _get_device_index(device, optional=True)
     _registered_external.setdefault(dev, {})[pool.id] = pool
 
 
 def deregister_external_mem_pool(
     pool: torch.cuda.MemPool, device: int | torch.device | None = None
 ) -> None:
-    dev = _mempool_device_index(device)
+    """Stop managing ``pool`` and drop the registry's reference to it."""
+    dev = _get_device_index(device, optional=True)
     pools = _registered_external.get(dev)
     if pools is not None:
         pools.pop(pool.id, None)
         if not pools:
             del _registered_external[dev]
-
-
-def registered_external_pool_ids(device: int) -> list[tuple[int, int]]:
-    return list(_registered_external.get(device, {}))
 
 
 def is_registered_external(device: int, pool_id: tuple[int, int]) -> bool:
@@ -369,7 +357,7 @@ def is_registered_external(device: int, pool_id: tuple[int, int]) -> bool:
 
 def _managed_pool_ids(device: int, primary: tuple[int, int]) -> list[tuple[int, int]]:
     "Primary capture pool first, then any registered external pools for the device."
-    return [primary] + [p for p in registered_external_pool_ids(device) if p != primary]
+    return [primary] + [p for p in _registered_external.get(device, {}) if p != primary]
 
 
 def mark_running_backward(device_index: int) -> None:
@@ -3541,14 +3529,9 @@ class CUDAGraphTreeManager:
         ]
         ptrs_to_deallocate = self.current_node.data_ptrs_dead_since_invocation()
         allocator = tree_backend.get_allocator_interface()
-        # Restore each managed pool's allocator state. setCheckpointPoolState only
-        # touches the pool its state was captured from, and addStorageDeleterFns
-        # re-attaches deleters only to storages whose data_ptr the restore
-        # re-allocated, so passing the full live-storage list to each call is safe.
-        for pool_id in self.current_node.managed_pools:
-            state = states.get(pool_id)
-            if state is None:
-                continue
+        # Each state restores only its own pool, so passing the full live-storage
+        # list to every call is safe.
+        for state in states.values():
             allocator.set_checkpoint_pool_state(
                 device,
                 state,
