@@ -490,7 +490,11 @@ class _LocalizedTensor(torch.Tensor):
                 primary = v
                 break
         if primary is None:
-            raise AssertionError("Localized op did not have a localized tensor?")
+            raise NotImplementedError(
+                f"{func} only accepts localized tensors as its weight and bias "
+                f"arguments (positions {localized_args}); got one in another "
+                "position."
+            )
 
         n_branches = len(primary._halves)
 
@@ -501,19 +505,17 @@ class _LocalizedTensor(torch.Tensor):
             if v is None:
                 localized_halves[i] = [None] * n_branches
                 continue
-            assert isinstance(v, _LocalizedTensor), (  # noqa: S101
-                f"{func} arg {i} must be None or a _LocalizedTensor; got "
-                f"{type(v).__name__}.  Use torch.cuda.localize(module) to "
-                "rewrite paired tensors (weight and bias) together."
-            )
-            assert v._ctx is primary._ctx, (  # noqa: S101
-                "all _LocalizedTensor args must share the same "
-                "_LocalizationContext (same device, same green contexts)."
-            )
-            assert len(v._halves) == n_branches, (  # noqa: S101
-                f"arg {i} has {len(v._halves)} halves; primary has "
-                f"{n_branches}; they must match."
-            )
+            if not isinstance(v, _LocalizedTensor):
+                raise TypeError(
+                    f"{func} arg {i} must be None or a _LocalizedTensor; got "
+                    f"{type(v).__name__}.  Use torch.cuda.localize(module) to "
+                    "rewrite paired tensors (weight and bias) together."
+                )
+            if v._ctx is not primary._ctx:
+                raise ValueError(
+                    f"{func} got localized tensors on different devices: "
+                    f"{v.device} and {primary.device}."
+                )
             localized_halves[i] = list(v._halves)
 
         # Pre-split sliced_args along dim 0.
