@@ -334,6 +334,14 @@ def register_external_mem_pool(
     tracked and checkpointed instead of being reported as leaks. Registering the
     same pool again overwrites the prior entry. The registry holds a strong
     reference to ``pool`` until ``deregister_external_mem_pool`` is called.
+
+    .. warning::
+        Starting a new recording or warmup can restore every managed pool to the
+        allocator state checkpointed after an earlier recording. Live allocations
+        made in ``pool`` outside cudagraph-managed regions after that checkpoint
+        are then marked free and may be overwritten by later allocations. Make
+        such allocations before the first recording, or keep them in a pool that
+        is not registered.
     """
     dev = _get_device_index(device, optional=True)
     _registered_external.setdefault(dev, {})[pool.id] = pool
