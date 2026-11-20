@@ -681,11 +681,7 @@ def _register_default_localizable_ops() -> None:
         _register_localizable_op(torch.ops.aten.linear.default, localized_args=(1, 2))
 
 
-def localize(
-    module: nn.Module,
-    *,
-    num_partitions: int | None = None,
-) -> nn.Module:
+def localize(module: nn.Module) -> nn.Module:
     r"""Localize every localizable layer in ``module``'s tree (recursive, in place).
 
     A layer is localizable when its type was registered as some op's
@@ -697,7 +693,10 @@ def localize(
     locality domains.  Forward calls on the layer then run the op as
     parallel branches on green-context-backed streams that occupy disjoint
     SM partitions, with the split parameters pre-placed into matching
-    locality-domain mempools.
+    locality-domain mempools.  Each localized parameter's ``dim 0`` must be
+    divisible by the device's locality-domain count (see
+    :func:`torch.cuda.green_contexts.get_num_locality_domains`); currently
+    only two domains are supported.
 
     The swap is done with :func:`torch.utils.swap_tensors`, which flips
     the parameter's ``__class__`` / ``__dict__`` / slots and the
@@ -745,11 +744,6 @@ def localize(
         module: the module (or model) to walk. Mutated in place.
             :class:`torch.fx.GraphModule` instances, including nested
             GraphModules, are not supported.
-        num_partitions: number of parts each parameter is split into.  Must
-            equal the device's locality-domain count, which is the default (see
-            :func:`torch.cuda.green_contexts.get_num_locality_domains`).
-            Currently only two domains are supported; this argument can be
-            omitted to query the count automatically.
 
     If a parameter's device does not support green-context localization
     (hardware without locality domains, or a driver older than CUDA
@@ -872,15 +866,10 @@ def localize(
         if not _localization_supported_or_warn(device):
             continue
         num_domains = get_num_locality_domains(device)
-        n = num_domains if num_partitions is None else num_partitions
-        if p.shape[0] % n != 0:
+        if p.shape[0] % num_domains != 0:
             raise ValueError(
-                f"tensor.shape[0] ({p.shape[0]}) must be divisible by "
-                f"num_partitions ({n})"
-            )
-        if n != num_domains:
-            raise NotImplementedError(
-                f"only {num_domains}-way splits supported on device {device}"
+                f"tensor.shape[0] ({p.shape[0]}) must be divisible by the number "
+                f"of locality domains ({num_domains})"
             )
         to_swap.append(p)
 
