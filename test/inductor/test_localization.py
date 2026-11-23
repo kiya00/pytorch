@@ -1286,7 +1286,7 @@ class TestLocalizationAllocatorMeta(TestCase):
             opt = torch.compile(loc_model, fullgraph=True)
             out = opt(x)
             torch.cuda.synchronize()
-        torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+        self.assertEqual(out, ref, rtol=1e-2, atol=1e-2)
 
     @_requires_green_contexts
     def test_compiled_numerics_match_eager_triton_fused(self):
@@ -1316,11 +1316,11 @@ class TestLocalizationAllocatorMeta(TestCase):
                 opt = torch.compile(loc_model, fullgraph=True)
                 out = opt(x)
                 torch.cuda.synchronize()
-        torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+        self.assertEqual(out, ref, rtol=1e-2, atol=1e-2)
 
     @_requires_green_contexts
     def test_fused_qkv_split_compiled(self):
-        """Compiled (reduce-overhead) companion to test_fused_qkv_split: the
+        """Compiled (reduce-overhead) companion to test_numerics_fused_qkv_split: the
         CUDA-graph-captured localized forward must match eager."""
         torch.manual_seed(0)
         hidden, num_heads, head_dim, batch, seq_len = 64, 4, 16, 2, 8
@@ -1338,7 +1338,7 @@ class TestLocalizationAllocatorMeta(TestCase):
             for _ in range(3):
                 out = opt(x, batch, seq_len)
             torch.cuda.synchronize()
-        torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+        self.assertEqual(out, ref, rtol=1e-2, atol=1e-2)
         # The point of this test is the captured graph; a skip would silently
         # downgrade it to an eager-ish run that still matches numerically.
         self.assertEqual(counters["inductor"]["cudagraph_skips"], 0)
