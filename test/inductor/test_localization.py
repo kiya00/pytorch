@@ -27,40 +27,26 @@ from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
     run_tests,
+    TEST_CUDA,
     TestCase,
 )
 
 
-def _requires_cuda(test_func):
-    """Skip test if CUDA is not available."""
-    return unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")(
-        test_func
-    )
+@functools.cache
+def _localization_supported():
+    # After init, the query uses the driver instead of NVML's best-effort guess.
+    torch.cuda.init()
+    return torch.cuda.green_contexts.is_localization_supported(0)
 
 
 def _requires_green_contexts(test_func):
-    """Skip test if localized green contexts are not supported."""
+    """Skip unless device 0 supports localization. Failures past that check,
+    such as a failing green context split, fail the test instead of skipping."""
 
     @functools.wraps(test_func)
     def wrapper(*args, **kwargs):
-        if not torch.cuda.is_available():
-            raise unittest.SkipTest("CUDA not available")
-        try:
-            from torch.cuda.green_contexts import (
-                GreenContext,
-                is_localization_supported,
-            )
-
-            if not is_localization_supported(0):
-                raise unittest.SkipTest(
-                    "Localized green contexts not supported on this device"
-                )
-            (gc,) = GreenContext.split(locality_domain_ids=(0,), device_id=0)
-            del gc
-        except unittest.SkipTest:
-            raise
-        except Exception as e:
-            raise unittest.SkipTest(f"Green contexts not supported: {e}") from e
+        if not TEST_CUDA or not _localization_supported():
+            raise unittest.SkipTest("requires a GPU with multiple locality domains")
         return test_func(*args, **kwargs)
 
     return wrapper
@@ -465,7 +451,7 @@ class TestLocalizeContract(TestCase):
             ret = torch.cuda.localize(m)
         self.assertIs(ret, m)
 
-    @_requires_cuda
+    @unittest.skipIf(not TEST_CUDA, "CUDA not available")
     def test_localize_rejects_weight_norm(self):
         from torch.nn.utils.parametrizations import weight_norm
 
@@ -496,7 +482,7 @@ class TestLocalizeContract(TestCase):
                 torch.cuda.localize(m)
         self.assertFalse(_is_localized_tensor(m[0].weight))
 
-    @_requires_cuda
+    @unittest.skipIf(not TEST_CUDA, "CUDA not available")
     def test_localize_skips_and_warns_once_when_unsupported(self):
         """On devices without locality-domain support, localize must leave
         the module untouched and warn once per process instead of raising.
