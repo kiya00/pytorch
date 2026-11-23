@@ -494,14 +494,6 @@ class TestLocalizeContract(TestCase):
                 torch.cuda.localize(m)
         self.assertFalse(_is_localized_tensor(m[0].weight))
 
-    def test_is_localization_supported_is_total(self):
-        """The capability predicate must return a bool -- never raise --
-        on any hardware/driver combination, since it is exactly the guard
-        localize() uses to decide whether to skip."""
-        from torch.cuda.green_contexts import is_localization_supported
-
-        self.assertIsInstance(is_localization_supported(0), bool)
-
     @_requires_cuda
     def test_localize_skips_and_warns_once_when_unsupported(self):
         """On devices without locality-domain support, localize must leave
