@@ -16,6 +16,7 @@ import contextlib
 import functools
 import unittest
 import warnings
+from typing import NamedTuple
 from unittest import mock
 
 import torch
@@ -23,6 +24,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.testing._internal.common_utils import (
     HardwareClassification,
+    instantiate_parametrized_tests,
+    parametrize,
     run_tests,
     TestCase,
 )
@@ -399,7 +402,6 @@ def _eager_and_localized(module_cls, ctor_args, forward_args, dtype=torch.float3
     loc = module_cls(*ctor_args).to(device="cuda", dtype=dtype).eval()
     with torch.inference_mode():
         torch.cuda.localize(loc)
-    with torch.inference_mode():
         y_eager = eager(*forward_args)
         y_loc = loc(*forward_args)
         torch.cuda.synchronize()
@@ -845,264 +847,104 @@ class TestLocalizableOpSlicedArgs(TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Tests: runtime numerics
+# Tests: eager vs. localized numerics.  Each layer's fork-join is
+# self-contained, so chains must match eager layer by layer; pointwise / view
+# tails run on the main stream after the cat.
 # ---------------------------------------------------------------------------
 
 
-class TestLocalizationRuntimeNumerics(TestCase):
+class _LinearThen(nn.Module):
+    """``tail(fc(x))`` for a single 64 -> 128 linear."""
+
+    def __init__(self, tail, bias):
+        super().__init__()
+        self.fc = nn.Linear(64, 128, bias=bias)
+        self.tail = tail
+
+    def forward(self, x):
+        return self.tail(self.fc(x))
+
+
+class _NumericsCase(NamedTuple):
+    module_cls: type
+    ctor_args: tuple
+    x_shape: tuple
+    tol: float
+    extra_forward_args: tuple = ()
+    seed: int | None = None
+
+
+_NUMERICS_CASES = {
+    "basic_linear": _NumericsCase(_OneLinear, (64, 128), (32, 64), 1e-4),
+    "linear_with_pointwise_relu": _NumericsCase(_LinearReLU, (64, 128), (32, 64), 1e-4),
+    "linear_with_leaky_relu": _NumericsCase(
+        _LinearLeakyReLU, (64, 128), (32, 64), 1e-4
+    ),
+    "two_sequential_linears": _NumericsCase(
+        _TwoSequentialLinears, (64, 128, 64), (32, 64), 1e-3
+    ),
+    "two_independent_linears": _NumericsCase(
+        _TwoIndependentLinears, (64, 128), (32, 64), 1e-4
+    ),
+    "linear_bias_sin": _NumericsCase(_LinearBiasSin, (64, 128), (32, 64), 1e-4),
+    "attention_qkv": _NumericsCase(_AttentionQKV, (64, 4, 16), (16, 64), 1e-3, (2, 8)),
+    "ffn_residual_layernorm": _NumericsCase(_FFNResidualLN, (64, 128), (16, 64), 1e-3),
+    "fused_qkv_split": _NumericsCase(_FusedQKV, (64, 4, 16), (16, 64), 1e-3, (2, 8)),
+    "chain_2": _NumericsCase(_NSequentialLinears, ([64, 48, 32],), (32, 64), 1e-3),
+    "chain_mm_gelu_mm": _NumericsCase(_LinearGELULinear, (64, 64, 32), (32, 64), 1e-3),
+    "chain_3": _NumericsCase(_NSequentialLinears, ([64, 64, 64, 32],), (16, 64), 1e-3),
+    "chain_4": _NumericsCase(
+        _NSequentialLinears, ([64, 64, 64, 64, 32],), (8, 64), 1e-3
+    ),
+    "chain_head_escapes": _NumericsCase(
+        _LinearHeadEscapes, (64, 64, 48, 32), (16, 64), 1e-3
+    ),
+    "chain_head_escapes_two_layer": _NumericsCase(
+        _LinearHeadEscapes2, (64, 128, 96), (32, 64), 1e-3, seed=0
+    ),
+    "chain_multiple_consumers": _NumericsCase(
+        _MultiConsumerHead, (64, 64, 32, 32), (16, 64), 1e-3
+    ),
+    "view_merge_inner_split": _NumericsCase(_LinearMergeInnerSplit, (), (6, 3), 1e-4),
+    "linear_with_bias": _NumericsCase(_OneLinear, (64, 128, True), (32, 64), 1e-4),
+    "linear_bias_relu": _NumericsCase(_LinearThen, (torch.relu, True), (32, 64), 1e-4),
+    "packing_stops_at_reduction": _NumericsCase(
+        _LinearThen, (torch.sum, True), (32, 64), 1e-3
+    ),
+    "packing_through_unsqueeze": _NumericsCase(
+        _LinearThen, (lambda y: y.unsqueeze(0), False), (32, 64), 1e-4
+    ),
+    "packing_through_transpose": _NumericsCase(
+        _LinearThen, (lambda y: y.t(), False), (32, 64), 1e-4
+    ),
+    "packing_through_contiguous": _NumericsCase(
+        _LinearThen, (lambda y: y.contiguous(), True), (32, 64), 1e-4
+    ),
+    "linear_bias_gelu": _NumericsCase(_LinearThen, (F.gelu, True), (32, 64), 1e-4),
+    "view_after_linear": _NumericsCase(
+        _LinearThen, (lambda y: y.reshape(-1), False), (32, 64), 1e-4
+    ),
+}
+
+
+@instantiate_parametrized_tests
+class TestLocalizationNumerics(TestCase):
     """The localized forward must match the eager forward across common
     model patterns."""
 
     hw_classification = HardwareClassification.CUDA
 
+    @parametrize("case", list(_NUMERICS_CASES), name_fn=lambda case: case)
     @_requires_green_contexts
-    def test_basic_linear(self):
-        x = torch.randn(32, 64, device="cuda")
-        y_e, y_l, _ = _eager_and_localized(_OneLinear, (64, 128), (x,))
-        self.assertEqual(y_l, y_e, atol=1e-4, rtol=1e-4)
-
-    @_requires_green_contexts
-    def test_linear_with_pointwise_relu(self):
-        x = torch.randn(32, 64, device="cuda")
-        y_e, y_l, _ = _eager_and_localized(_LinearReLU, (64, 128), (x,))
-        self.assertEqual(y_l, y_e, atol=1e-4, rtol=1e-4)
-
-    @_requires_green_contexts
-    def test_linear_with_leaky_relu(self):
-        x = torch.randn(32, 64, device="cuda")
-        y_e, y_l, _ = _eager_and_localized(_LinearLeakyReLU, (64, 128), (x,))
-        self.assertEqual(y_l, y_e, atol=1e-4, rtol=1e-4)
-
-    @_requires_green_contexts
-    def test_two_sequential_linears(self):
-        x = torch.randn(32, 64, device="cuda")
-        y_e, y_l, _ = _eager_and_localized(_TwoSequentialLinears, (64, 128, 64), (x,))
-        self.assertEqual(y_l, y_e, atol=1e-3, rtol=1e-3)
-
-    @_requires_green_contexts
-    def test_two_independent_linears(self):
-        x = torch.randn(32, 64, device="cuda")
-        y_e, y_l, _ = _eager_and_localized(_TwoIndependentLinears, (64, 128), (x,))
-        self.assertEqual(y_l, y_e, atol=1e-4, rtol=1e-4)
-
-    @_requires_green_contexts
-    def test_linear_bias_sin(self):
-        x = torch.randn(32, 64, device="cuda")
-        y_e, y_l, _ = _eager_and_localized(_LinearBiasSin, (64, 128), (x,))
-        self.assertEqual(y_l, y_e, atol=1e-4, rtol=1e-4)
-
-    @_requires_green_contexts
-    def test_attention_qkv(self):
-        batch, seq_len, hidden, num_heads, head_dim = 2, 8, 64, 4, 16
-        x = torch.randn(batch * seq_len, hidden, device="cuda")
+    def test_numerics(self, case):
+        c = _NUMERICS_CASES[case]
+        if c.seed is not None:
+            torch.manual_seed(c.seed)
+        x = torch.randn(c.x_shape, device="cuda")
         y_e, y_l, _ = _eager_and_localized(
-            _AttentionQKV,
-            (hidden, num_heads, head_dim),
-            (x, batch, seq_len),
+            c.module_cls, c.ctor_args, (x, *c.extra_forward_args)
         )
-        self.assertEqual(y_l, y_e, atol=1e-3, rtol=1e-3)
-
-    @_requires_green_contexts
-    def test_ffn_residual_layernorm(self):
-        batch, seq_len, hidden, ffn_dim = 2, 8, 64, 128
-        x = torch.randn(batch * seq_len, hidden, device="cuda")
-        y_e, y_l, _ = _eager_and_localized(_FFNResidualLN, (hidden, ffn_dim), (x,))
-        self.assertEqual(y_l, y_e, atol=1e-3, rtol=1e-3)
-
-    @_requires_green_contexts
-    def test_fused_qkv_split(self):
-        batch, seq_len, hidden, num_heads, head_dim = 2, 8, 64, 4, 16
-        x = torch.randn(batch * seq_len, hidden, device="cuda")
-        y_e, y_l, _ = _eager_and_localized(
-            _FusedQKV,
-            (hidden, num_heads, head_dim),
-            (x, batch, seq_len),
-        )
-        self.assertEqual(y_l, y_e, atol=1e-3, rtol=1e-3)
-
-
-# ---------------------------------------------------------------------------
-# Tests: chain numerics (multiple sequential linears).  Each layer's
-# fork-join is self-contained, so chains must match eager layer by layer.
-# ---------------------------------------------------------------------------
-
-
-class TestLocalizationChainNumerics(TestCase):
-    hw_classification = HardwareClassification.CUDA
-
-    @_requires_green_contexts
-    def test_chain_2(self):
-        x = torch.randn(32, 64, device="cuda")
-        y_e, y_l, _ = _eager_and_localized(_NSequentialLinears, ([64, 48, 32],), (x,))
-        self.assertEqual(y_l, y_e, atol=1e-3, rtol=1e-3)
-
-    @_requires_green_contexts
-    def test_chain_mm_gelu_mm(self):
-        x = torch.randn(32, 64, device="cuda")
-        y_e, y_l, _ = _eager_and_localized(_LinearGELULinear, (64, 64, 32), (x,))
-        self.assertEqual(y_l, y_e, atol=1e-3, rtol=1e-3)
-
-    @_requires_green_contexts
-    def test_chain_3(self):
-        x = torch.randn(16, 64, device="cuda")
-        y_e, y_l, _ = _eager_and_localized(
-            _NSequentialLinears, ([64, 64, 64, 32],), (x,)
-        )
-        self.assertEqual(y_l, y_e, atol=1e-3, rtol=1e-3)
-
-    @_requires_green_contexts
-    def test_chain_4(self):
-        x = torch.randn(8, 64, device="cuda")
-        y_e, y_l, _ = _eager_and_localized(
-            _NSequentialLinears, ([64, 64, 64, 64, 32],), (x,)
-        )
-        self.assertEqual(y_l, y_e, atol=1e-3, rtol=1e-3)
-
-    @_requires_green_contexts
-    def test_chain_head_escapes(self):
-        x = torch.randn(16, 64, device="cuda")
-        y_e_pair, y_l_pair, _ = _eager_and_localized(
-            _LinearHeadEscapes, (64, 64, 48, 32), (x,)
-        )
-        for ye, yl in zip(y_e_pair, y_l_pair):
-            self.assertEqual(yl, ye, atol=1e-3, rtol=1e-3)
-
-    @_requires_green_contexts
-    def test_chain_head_escapes_two_layer(self):
-        torch.manual_seed(0)
-        x = torch.randn(32, 64, device="cuda")
-        y_e_pair, y_l_pair, _ = _eager_and_localized(
-            _LinearHeadEscapes2, (64, 128, 96), (x,)
-        )
-        for ye, yl in zip(y_e_pair, y_l_pair):
-            self.assertEqual(yl, ye, atol=1e-3, rtol=1e-3)
-
-    @_requires_green_contexts
-    def test_chain_multiple_consumers(self):
-        x = torch.randn(16, 64, device="cuda")
-        y_e, y_l, _ = _eager_and_localized(_MultiConsumerHead, (64, 64, 32, 32), (x,))
-        self.assertEqual(y_l, y_e, atol=1e-3, rtol=1e-3)
-
-    @_requires_green_contexts
-    def test_view_merge_inner_split(self):
-        x = torch.randn(6, 3, device="cuda")
-        y_e, y_l, _ = _eager_and_localized(_LinearMergeInnerSplit, (), (x,))
-        self.assertEqual(y_l, y_e, atol=1e-4, rtol=1e-4)
-
-
-# ---------------------------------------------------------------------------
-# Tests: pointwise / view tails after a localized linear.  The tail runs on
-# the main stream after the cat.
-# ---------------------------------------------------------------------------
-
-
-class TestLocalizationPackingNumerics(TestCase):
-    hw_classification = HardwareClassification.CUDA
-
-    @_requires_green_contexts
-    def test_linear_with_bias(self):
-        """linear(x) + b: bias is now part of nn.Linear, no separate add."""
-        x = torch.randn(32, 64, device="cuda")
-        y_e, y_l, _ = _eager_and_localized(_OneLinear, (64, 128, True), (x,))
-        self.assertEqual(y_l, y_e, atol=1e-4, rtol=1e-4)
-
-    @_requires_green_contexts
-    def test_linear_bias_relu(self):
-        class M(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.fc = nn.Linear(64, 128, bias=True)
-
-            def forward(self, x):
-                return torch.relu(self.fc(x))
-
-        x = torch.randn(32, 64, device="cuda")
-        y_e, y_l, _ = _eager_and_localized(M, (), (x,))
-        self.assertEqual(y_l, y_e, atol=1e-4, rtol=1e-4)
-
-    @_requires_green_contexts
-    def test_packing_stops_at_reduction(self):
-        class M(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.fc = nn.Linear(64, 128, bias=True)
-
-            def forward(self, x):
-                return self.fc(x).sum()
-
-        x = torch.randn(32, 64, device="cuda")
-        y_e, y_l, _ = _eager_and_localized(M, (), (x,))
-        self.assertEqual(y_l, y_e, atol=1e-3, rtol=1e-3)
-
-    @_requires_green_contexts
-    def test_packing_through_unsqueeze(self):
-        class M(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.fc = nn.Linear(64, 128, bias=False)
-
-            def forward(self, x):
-                return self.fc(x).unsqueeze(0)
-
-        x = torch.randn(32, 64, device="cuda")
-        y_e, y_l, _ = _eager_and_localized(M, (), (x,))
-        self.assertEqual(y_l, y_e, atol=1e-4, rtol=1e-4)
-
-    @_requires_green_contexts
-    def test_packing_through_transpose(self):
-        class M(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.fc = nn.Linear(64, 128, bias=False)
-
-            def forward(self, x):
-                return self.fc(x).t()
-
-        x = torch.randn(32, 64, device="cuda")
-        y_e, y_l, _ = _eager_and_localized(M, (), (x,))
-        self.assertEqual(y_l, y_e, atol=1e-4, rtol=1e-4)
-
-    @_requires_green_contexts
-    def test_packing_through_contiguous(self):
-        class M(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.fc = nn.Linear(64, 128, bias=True)
-
-            def forward(self, x):
-                return self.fc(x).contiguous()
-
-        x = torch.randn(32, 64, device="cuda")
-        y_e, y_l, _ = _eager_and_localized(M, (), (x,))
-        self.assertEqual(y_l, y_e, atol=1e-4, rtol=1e-4)
-
-    @_requires_green_contexts
-    def test_linear_bias_gelu(self):
-        class M(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.fc = nn.Linear(64, 128, bias=True)
-
-            def forward(self, x):
-                return F.gelu(self.fc(x))
-
-        x = torch.randn(32, 64, device="cuda")
-        y_e, y_l, _ = _eager_and_localized(M, (), (x,))
-        self.assertEqual(y_l, y_e, atol=1e-4, rtol=1e-4)
-
-    @_requires_green_contexts
-    def test_view_after_linear(self):
-        class M(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.fc = nn.Linear(64, 128, bias=False)
-
-            def forward(self, x):
-                return self.fc(x).reshape(-1)
-
-        x = torch.randn(32, 64, device="cuda")
-        y_e, y_l, _ = _eager_and_localized(M, (), (x,))
-        self.assertEqual(y_l, y_e, atol=1e-4, rtol=1e-4)
+        self.assertEqual(y_l, y_e, atol=c.tol, rtol=c.tol)
 
 
 # ---------------------------------------------------------------------------
