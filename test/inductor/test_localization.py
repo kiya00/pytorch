@@ -574,10 +574,10 @@ class TestLocalizableOpRegistry(TestCase):
             F.linear(x, weight=w, bias=b),
             F.linear(input=x, weight=w, bias=b),
         ):
-            torch.testing.assert_close(by_keyword, positional, atol=0, rtol=0)
+            self.assertEqual(by_keyword, positional, atol=0, rtol=0)
         # Omitted entirely must mean "no bias", not "a bias of zeros by
         # accident" -- match an explicit None, and differ from the biased call.
-        torch.testing.assert_close(F.linear(x, w), F.linear(x, w, None), atol=0, rtol=0)
+        self.assertEqual(F.linear(x, w), F.linear(x, w, None), atol=0, rtol=0)
         self.assertFalse(torch.equal(F.linear(x, w), positional))
 
     @_requires_green_contexts
@@ -593,7 +593,7 @@ class TestLocalizableOpRegistry(TestCase):
         with torch.inference_mode():
             torch.cuda.localize(m)
         got = F.linear(x, weight=m.fc.weight, bias=m.fc.bias)
-        torch.testing.assert_close(got, expected, atol=1e-4, rtol=1e-4)
+        self.assertEqual(got, expected, atol=1e-4, rtol=1e-4)
 
 
 class _ScaledLinear(nn.Module):
@@ -666,7 +666,7 @@ class TestLocalizableOpRegistryCustomOp(TestCase):
             torch.cuda.localize(m)
         self.assertTrue(_is_localized_tensor(m.weight))
         self.assertTrue(_is_localized_tensor(m.bias))
-        torch.testing.assert_close(m(x), expected, atol=1e-4, rtol=1e-4)
+        self.assertEqual(m(x), expected, atol=1e-4, rtol=1e-4)
 
     @_requires_green_contexts
     def test_module_walk_is_registry_driven(self):
@@ -788,7 +788,7 @@ class TestLocalizableOpSlicedArgs(TestCase):
         self.assertTrue(_is_localized_tensor(m.weight))
         # The scale is a buffer, so it stays whole and gets sliced per call.
         self.assertFalse(_is_localized_tensor(m.scale))
-        torch.testing.assert_close(m(x), expected, atol=1e-4, rtol=1e-4)
+        self.assertEqual(m(x), expected, atol=1e-4, rtol=1e-4)
 
     @_requires_green_contexts
     def test_sliced_arg_may_be_none(self):
@@ -801,7 +801,7 @@ class TestLocalizableOpSlicedArgs(TestCase):
         with torch.inference_mode():
             torch.cuda.localize(m)
         got = self._op(x, m.weight, m.bias, None)
-        torch.testing.assert_close(got, expected, atol=1e-4, rtol=1e-4)
+        self.assertEqual(got, expected, atol=1e-4, rtol=1e-4)
 
     @_requires_green_contexts
     def test_sliced_arg_list_of_tensors(self):
@@ -815,7 +815,7 @@ class TestLocalizableOpSlicedArgs(TestCase):
         with torch.inference_mode():
             torch.cuda.localize(m)
         got = self._op(x, m.weight, m.bias, m.scale, extra)
-        torch.testing.assert_close(got, expected, atol=1e-4, rtol=1e-4)
+        self.assertEqual(got, expected, atol=1e-4, rtol=1e-4)
 
     @_requires_green_contexts
     def test_sliced_arg_empty_list(self):
@@ -828,7 +828,7 @@ class TestLocalizableOpSlicedArgs(TestCase):
         with torch.inference_mode():
             torch.cuda.localize(m)
         got = self._op(x, m.weight, m.bias, m.scale, [])
-        torch.testing.assert_close(got, expected, atol=1e-4, rtol=1e-4)
+        self.assertEqual(got, expected, atol=1e-4, rtol=1e-4)
 
     @_requires_green_contexts
     def test_unsliceable_sliced_arg_raises(self):
@@ -859,37 +859,37 @@ class TestLocalizationRuntimeNumerics(TestCase):
     def test_basic_linear(self):
         x = torch.randn(32, 64, device="cuda")
         y_e, y_l, _ = _eager_and_localized(_OneLinear, (64, 128), (x,))
-        torch.testing.assert_close(y_l, y_e, atol=1e-4, rtol=1e-4)
+        self.assertEqual(y_l, y_e, atol=1e-4, rtol=1e-4)
 
     @_requires_green_contexts
     def test_linear_with_pointwise_relu(self):
         x = torch.randn(32, 64, device="cuda")
         y_e, y_l, _ = _eager_and_localized(_LinearReLU, (64, 128), (x,))
-        torch.testing.assert_close(y_l, y_e, atol=1e-4, rtol=1e-4)
+        self.assertEqual(y_l, y_e, atol=1e-4, rtol=1e-4)
 
     @_requires_green_contexts
     def test_linear_with_leaky_relu(self):
         x = torch.randn(32, 64, device="cuda")
         y_e, y_l, _ = _eager_and_localized(_LinearLeakyReLU, (64, 128), (x,))
-        torch.testing.assert_close(y_l, y_e, atol=1e-4, rtol=1e-4)
+        self.assertEqual(y_l, y_e, atol=1e-4, rtol=1e-4)
 
     @_requires_green_contexts
     def test_two_sequential_linears(self):
         x = torch.randn(32, 64, device="cuda")
         y_e, y_l, _ = _eager_and_localized(_TwoSequentialLinears, (64, 128, 64), (x,))
-        torch.testing.assert_close(y_l, y_e, atol=1e-3, rtol=1e-3)
+        self.assertEqual(y_l, y_e, atol=1e-3, rtol=1e-3)
 
     @_requires_green_contexts
     def test_two_independent_linears(self):
         x = torch.randn(32, 64, device="cuda")
         y_e, y_l, _ = _eager_and_localized(_TwoIndependentLinears, (64, 128), (x,))
-        torch.testing.assert_close(y_l, y_e, atol=1e-4, rtol=1e-4)
+        self.assertEqual(y_l, y_e, atol=1e-4, rtol=1e-4)
 
     @_requires_green_contexts
     def test_linear_bias_sin(self):
         x = torch.randn(32, 64, device="cuda")
         y_e, y_l, _ = _eager_and_localized(_LinearBiasSin, (64, 128), (x,))
-        torch.testing.assert_close(y_l, y_e, atol=1e-4, rtol=1e-4)
+        self.assertEqual(y_l, y_e, atol=1e-4, rtol=1e-4)
 
     @_requires_green_contexts
     def test_attention_qkv(self):
@@ -900,14 +900,14 @@ class TestLocalizationRuntimeNumerics(TestCase):
             (hidden, num_heads, head_dim),
             (x, batch, seq_len),
         )
-        torch.testing.assert_close(y_l, y_e, atol=1e-3, rtol=1e-3)
+        self.assertEqual(y_l, y_e, atol=1e-3, rtol=1e-3)
 
     @_requires_green_contexts
     def test_ffn_residual_layernorm(self):
         batch, seq_len, hidden, ffn_dim = 2, 8, 64, 128
         x = torch.randn(batch * seq_len, hidden, device="cuda")
         y_e, y_l, _ = _eager_and_localized(_FFNResidualLN, (hidden, ffn_dim), (x,))
-        torch.testing.assert_close(y_l, y_e, atol=1e-3, rtol=1e-3)
+        self.assertEqual(y_l, y_e, atol=1e-3, rtol=1e-3)
 
     @_requires_green_contexts
     def test_fused_qkv_split(self):
@@ -918,7 +918,7 @@ class TestLocalizationRuntimeNumerics(TestCase):
             (hidden, num_heads, head_dim),
             (x, batch, seq_len),
         )
-        torch.testing.assert_close(y_l, y_e, atol=1e-3, rtol=1e-3)
+        self.assertEqual(y_l, y_e, atol=1e-3, rtol=1e-3)
 
 
 # ---------------------------------------------------------------------------
@@ -934,13 +934,13 @@ class TestLocalizationChainNumerics(TestCase):
     def test_chain_2(self):
         x = torch.randn(32, 64, device="cuda")
         y_e, y_l, _ = _eager_and_localized(_NSequentialLinears, ([64, 48, 32],), (x,))
-        torch.testing.assert_close(y_l, y_e, atol=1e-3, rtol=1e-3)
+        self.assertEqual(y_l, y_e, atol=1e-3, rtol=1e-3)
 
     @_requires_green_contexts
     def test_chain_mm_gelu_mm(self):
         x = torch.randn(32, 64, device="cuda")
         y_e, y_l, _ = _eager_and_localized(_LinearGELULinear, (64, 64, 32), (x,))
-        torch.testing.assert_close(y_l, y_e, atol=1e-3, rtol=1e-3)
+        self.assertEqual(y_l, y_e, atol=1e-3, rtol=1e-3)
 
     @_requires_green_contexts
     def test_chain_3(self):
@@ -948,7 +948,7 @@ class TestLocalizationChainNumerics(TestCase):
         y_e, y_l, _ = _eager_and_localized(
             _NSequentialLinears, ([64, 64, 64, 32],), (x,)
         )
-        torch.testing.assert_close(y_l, y_e, atol=1e-3, rtol=1e-3)
+        self.assertEqual(y_l, y_e, atol=1e-3, rtol=1e-3)
 
     @_requires_green_contexts
     def test_chain_4(self):
@@ -956,7 +956,7 @@ class TestLocalizationChainNumerics(TestCase):
         y_e, y_l, _ = _eager_and_localized(
             _NSequentialLinears, ([64, 64, 64, 64, 32],), (x,)
         )
-        torch.testing.assert_close(y_l, y_e, atol=1e-3, rtol=1e-3)
+        self.assertEqual(y_l, y_e, atol=1e-3, rtol=1e-3)
 
     @_requires_green_contexts
     def test_chain_head_escapes(self):
@@ -965,7 +965,7 @@ class TestLocalizationChainNumerics(TestCase):
             _LinearHeadEscapes, (64, 64, 48, 32), (x,)
         )
         for ye, yl in zip(y_e_pair, y_l_pair):
-            torch.testing.assert_close(yl, ye, atol=1e-3, rtol=1e-3)
+            self.assertEqual(yl, ye, atol=1e-3, rtol=1e-3)
 
     @_requires_green_contexts
     def test_chain_head_escapes_two_layer(self):
@@ -975,19 +975,19 @@ class TestLocalizationChainNumerics(TestCase):
             _LinearHeadEscapes2, (64, 128, 96), (x,)
         )
         for ye, yl in zip(y_e_pair, y_l_pair):
-            torch.testing.assert_close(yl, ye, atol=1e-3, rtol=1e-3)
+            self.assertEqual(yl, ye, atol=1e-3, rtol=1e-3)
 
     @_requires_green_contexts
     def test_chain_multiple_consumers(self):
         x = torch.randn(16, 64, device="cuda")
         y_e, y_l, _ = _eager_and_localized(_MultiConsumerHead, (64, 64, 32, 32), (x,))
-        torch.testing.assert_close(y_l, y_e, atol=1e-3, rtol=1e-3)
+        self.assertEqual(y_l, y_e, atol=1e-3, rtol=1e-3)
 
     @_requires_green_contexts
     def test_view_merge_inner_split(self):
         x = torch.randn(6, 3, device="cuda")
         y_e, y_l, _ = _eager_and_localized(_LinearMergeInnerSplit, (), (x,))
-        torch.testing.assert_close(y_l, y_e, atol=1e-4, rtol=1e-4)
+        self.assertEqual(y_l, y_e, atol=1e-4, rtol=1e-4)
 
 
 # ---------------------------------------------------------------------------
@@ -1004,7 +1004,7 @@ class TestLocalizationPackingNumerics(TestCase):
         """linear(x) + b: bias is now part of nn.Linear, no separate add."""
         x = torch.randn(32, 64, device="cuda")
         y_e, y_l, _ = _eager_and_localized(_OneLinear, (64, 128, True), (x,))
-        torch.testing.assert_close(y_l, y_e, atol=1e-4, rtol=1e-4)
+        self.assertEqual(y_l, y_e, atol=1e-4, rtol=1e-4)
 
     @_requires_green_contexts
     def test_linear_bias_relu(self):
@@ -1018,7 +1018,7 @@ class TestLocalizationPackingNumerics(TestCase):
 
         x = torch.randn(32, 64, device="cuda")
         y_e, y_l, _ = _eager_and_localized(M, (), (x,))
-        torch.testing.assert_close(y_l, y_e, atol=1e-4, rtol=1e-4)
+        self.assertEqual(y_l, y_e, atol=1e-4, rtol=1e-4)
 
     @_requires_green_contexts
     def test_packing_stops_at_reduction(self):
@@ -1032,7 +1032,7 @@ class TestLocalizationPackingNumerics(TestCase):
 
         x = torch.randn(32, 64, device="cuda")
         y_e, y_l, _ = _eager_and_localized(M, (), (x,))
-        torch.testing.assert_close(y_l, y_e, atol=1e-3, rtol=1e-3)
+        self.assertEqual(y_l, y_e, atol=1e-3, rtol=1e-3)
 
     @_requires_green_contexts
     def test_packing_through_unsqueeze(self):
@@ -1046,7 +1046,7 @@ class TestLocalizationPackingNumerics(TestCase):
 
         x = torch.randn(32, 64, device="cuda")
         y_e, y_l, _ = _eager_and_localized(M, (), (x,))
-        torch.testing.assert_close(y_l, y_e, atol=1e-4, rtol=1e-4)
+        self.assertEqual(y_l, y_e, atol=1e-4, rtol=1e-4)
 
     @_requires_green_contexts
     def test_packing_through_transpose(self):
@@ -1060,7 +1060,7 @@ class TestLocalizationPackingNumerics(TestCase):
 
         x = torch.randn(32, 64, device="cuda")
         y_e, y_l, _ = _eager_and_localized(M, (), (x,))
-        torch.testing.assert_close(y_l, y_e, atol=1e-4, rtol=1e-4)
+        self.assertEqual(y_l, y_e, atol=1e-4, rtol=1e-4)
 
     @_requires_green_contexts
     def test_packing_through_contiguous(self):
@@ -1074,7 +1074,7 @@ class TestLocalizationPackingNumerics(TestCase):
 
         x = torch.randn(32, 64, device="cuda")
         y_e, y_l, _ = _eager_and_localized(M, (), (x,))
-        torch.testing.assert_close(y_l, y_e, atol=1e-4, rtol=1e-4)
+        self.assertEqual(y_l, y_e, atol=1e-4, rtol=1e-4)
 
     @_requires_green_contexts
     def test_linear_bias_gelu(self):
@@ -1088,7 +1088,7 @@ class TestLocalizationPackingNumerics(TestCase):
 
         x = torch.randn(32, 64, device="cuda")
         y_e, y_l, _ = _eager_and_localized(M, (), (x,))
-        torch.testing.assert_close(y_l, y_e, atol=1e-4, rtol=1e-4)
+        self.assertEqual(y_l, y_e, atol=1e-4, rtol=1e-4)
 
     @_requires_green_contexts
     def test_view_after_linear(self):
@@ -1102,7 +1102,7 @@ class TestLocalizationPackingNumerics(TestCase):
 
         x = torch.randn(32, 64, device="cuda")
         y_e, y_l, _ = _eager_and_localized(M, (), (x,))
-        torch.testing.assert_close(y_l, y_e, atol=1e-4, rtol=1e-4)
+        self.assertEqual(y_l, y_e, atol=1e-4, rtol=1e-4)
 
 
 # ---------------------------------------------------------------------------
@@ -1121,7 +1121,7 @@ class TestLocalizationSharedWeight(TestCase):
         x1 = torch.randn(32, 64, device="cuda")
         x2 = torch.randn(32, 64, device="cuda")
         y_e, y_l, _ = _eager_and_localized(_SharedLinearTwoCalls, (64, 128), (x1, x2))
-        torch.testing.assert_close(y_l, y_e, atol=1e-4, rtol=1e-4)
+        self.assertEqual(y_l, y_e, atol=1e-4, rtol=1e-4)
 
     @_requires_green_contexts
     def test_tied_embedding_lm_head(self):
@@ -1149,7 +1149,7 @@ class TestLocalizationSharedWeight(TestCase):
 
         x = torch.tensor([0, 1, 2, 3], device="cuda")
         with torch.inference_mode():
-            torch.testing.assert_close(loc(x), eager(x), atol=1e-4, rtol=1e-4)
+            self.assertEqual(loc(x), eager(x), atol=1e-4, rtol=1e-4)
 
 
 # ---------------------------------------------------------------------------
@@ -1167,7 +1167,7 @@ class TestLocalizationDtypes(TestCase):
         y_e, y_l, _ = _eager_and_localized(
             _OneLinear, (64, 128), (x,), dtype=torch.float16
         )
-        torch.testing.assert_close(y_l, y_e, atol=5e-3, rtol=5e-3)
+        self.assertEqual(y_l, y_e, atol=5e-3, rtol=5e-3)
 
     @_requires_green_contexts
     @_requires_cublas_tensorop_on_green_streams
@@ -1176,7 +1176,7 @@ class TestLocalizationDtypes(TestCase):
         y_e, y_l, _ = _eager_and_localized(
             _OneLinear, (64, 128), (x,), dtype=torch.bfloat16
         )
-        torch.testing.assert_close(y_l, y_e, atol=5e-3, rtol=5e-3)
+        self.assertEqual(y_l, y_e, atol=5e-3, rtol=5e-3)
 
 
 class TestLocalizationRequiresInferenceMode(TestCase):
