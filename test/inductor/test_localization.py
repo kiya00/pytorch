@@ -563,22 +563,21 @@ class TestLocalizableOpRegistry(TestCase):
         """A localized position is resolved whether the caller passed it
         positionally, by keyword, or omitted it entirely."""
         m = _OneLinear(64, 128, bias=True).cuda()
+        x = torch.randn(32, 64, device="cuda")
         with torch.inference_mode():
             torch.cuda.localize(m)
-        w, b = m.fc.weight, m.fc.bias
-        x = torch.randn(32, 64, device="cuda")
-
-        positional = F.linear(x, w, b)
-        for by_keyword in (
-            F.linear(x, w, bias=b),
-            F.linear(x, weight=w, bias=b),
-            F.linear(input=x, weight=w, bias=b),
-        ):
-            self.assertEqual(by_keyword, positional, atol=0, rtol=0)
-        # Omitted entirely must mean "no bias", not "a bias of zeros by
-        # accident" -- match an explicit None, and differ from the biased call.
-        self.assertEqual(F.linear(x, w), F.linear(x, w, None), atol=0, rtol=0)
-        self.assertFalse(torch.equal(F.linear(x, w), positional))
+            w, b = m.fc.weight, m.fc.bias
+            positional = F.linear(x, w, b)
+            for by_keyword in (
+                F.linear(x, w, bias=b),
+                F.linear(x, weight=w, bias=b),
+                F.linear(input=x, weight=w, bias=b),
+            ):
+                self.assertEqual(by_keyword, positional, atol=0, rtol=0)
+            # Omitted entirely must mean "no bias", not "a bias of zeros by
+            # accident" -- match an explicit None, and differ from the biased call.
+            self.assertEqual(F.linear(x, w), F.linear(x, w, None), atol=0, rtol=0)
+            self.assertFalse(torch.equal(F.linear(x, w), positional))
 
     @_requires_green_contexts
     def test_keyword_localized_arg_matches_unlocalized(self):
@@ -592,7 +591,7 @@ class TestLocalizableOpRegistry(TestCase):
 
         with torch.inference_mode():
             torch.cuda.localize(m)
-        got = F.linear(x, weight=m.fc.weight, bias=m.fc.bias)
+            got = F.linear(x, weight=m.fc.weight, bias=m.fc.bias)
         self.assertEqual(got, expected, atol=1e-4, rtol=1e-4)
 
 
@@ -664,9 +663,10 @@ class TestLocalizableOpRegistryCustomOp(TestCase):
 
         with torch.inference_mode():
             torch.cuda.localize(m)
+            got = m(x)
         self.assertTrue(_is_localized_tensor(m.weight))
         self.assertTrue(_is_localized_tensor(m.bias))
-        self.assertEqual(m(x), expected, atol=1e-4, rtol=1e-4)
+        self.assertEqual(got, expected, atol=1e-4, rtol=1e-4)
 
     @_requires_green_contexts
     def test_module_walk_is_registry_driven(self):
@@ -785,10 +785,11 @@ class TestLocalizableOpSlicedArgs(TestCase):
 
         with torch.inference_mode():
             torch.cuda.localize(m)
+            got = m(x)
         self.assertTrue(_is_localized_tensor(m.weight))
         # The scale is a buffer, so it stays whole and gets sliced per call.
         self.assertFalse(_is_localized_tensor(m.scale))
-        self.assertEqual(m(x), expected, atol=1e-4, rtol=1e-4)
+        self.assertEqual(got, expected, atol=1e-4, rtol=1e-4)
 
     @_requires_green_contexts
     def test_sliced_arg_may_be_none(self):
@@ -800,7 +801,7 @@ class TestLocalizableOpSlicedArgs(TestCase):
 
         with torch.inference_mode():
             torch.cuda.localize(m)
-        got = self._op(x, m.weight, m.bias, None)
+            got = self._op(x, m.weight, m.bias, None)
         self.assertEqual(got, expected, atol=1e-4, rtol=1e-4)
 
     @_requires_green_contexts
@@ -814,7 +815,7 @@ class TestLocalizableOpSlicedArgs(TestCase):
 
         with torch.inference_mode():
             torch.cuda.localize(m)
-        got = self._op(x, m.weight, m.bias, m.scale, extra)
+            got = self._op(x, m.weight, m.bias, m.scale, extra)
         self.assertEqual(got, expected, atol=1e-4, rtol=1e-4)
 
     @_requires_green_contexts
@@ -827,7 +828,7 @@ class TestLocalizableOpSlicedArgs(TestCase):
 
         with torch.inference_mode():
             torch.cuda.localize(m)
-        got = self._op(x, m.weight, m.bias, m.scale, [])
+            got = self._op(x, m.weight, m.bias, m.scale, [])
         self.assertEqual(got, expected, atol=1e-4, rtol=1e-4)
 
     @_requires_green_contexts
@@ -838,10 +839,9 @@ class TestLocalizableOpSlicedArgs(TestCase):
         x = torch.randn(32, 64, device="cuda")
         with torch.inference_mode():
             torch.cuda.localize(m)
-
-        self._register(sliced_args=(5,))  # 'bogus', a float
-        with self.assertRaisesRegex(TypeError, "must be None, Tensor, or list"):
-            self._op(x, m.weight, m.bias, m.scale, [], 2.0)
+            self._register(sliced_args=(5,))  # 'bogus', a float
+            with self.assertRaisesRegex(TypeError, "must be None, Tensor, or list"):
+                self._op(x, m.weight, m.bias, m.scale, [], 2.0)
 
 
 # ---------------------------------------------------------------------------
