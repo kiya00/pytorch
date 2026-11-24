@@ -170,19 +170,12 @@ _LOCALIZATION_CONTEXT_CACHE: dict[int, _LocalizationContext] = {}
 #
 # Downstream libraries register their linear-shaped custom ops here so
 # :class:`_LocalizedTensor`'s dispatch override knows how to split them
-# across the locality-domain branches.  Three argument categories per op:
+# across the locality-domain branches.  Two argument categories per op:
 #
 #   - ``localized_args``: arg positions that are pre-localized; each is
 #     expected to be a :class:`_LocalizedTensor` (or ``None``) and the
 #     dispatch reads its halves directly.  Typically the weight and an
 #     optional bias.
-#
-#   - ``sliced_args``: arg positions that should be split per-branch as a
-#     view but are *not* pool-localized.  Used for per-output-channel
-#     side tensors like quantization scales -- they are small enough that
-#     keeping them in the default pool has negligible locality cost.
-#     Values may be ``None``, an empty list, a Tensor, or a List[Tensor];
-#     the dispatch handles each accordingly.
 #
 #   - everything else: passed through unchanged to each branch.
 #
@@ -194,7 +187,6 @@ _LOCALIZATION_CONTEXT_CACHE: dict[int, _LocalizationContext] = {}
 
 class _LocalizableOpMeta(NamedTuple):
     localized_args: tuple[int, ...]
-    sliced_args: tuple[int, ...]
     # Signature order, for finding args the caller passed by keyword.  Empty
     # when the op has no schema to read them from and none were supplied, in
     # which case only positional args can be localized.
@@ -211,15 +203,13 @@ def _register_localizable_op(
     op: Any,
     *,
     localized_args: Sequence[int],
-    sliced_args: Sequence[int] = (),
     arg_names: Sequence[str] | None = None,
     module_type: type[nn.Module] | None = None,
 ) -> None:
     """Register ``op`` as localizable.
 
     When :class:`_LocalizedTensor`'s dispatch fires on ``op``, the framework
-    reads halves from each ``localized_args`` position, slices each
-    ``sliced_args`` position along ``dim 0`` per branch, passes everything
+    reads halves from each ``localized_args`` position, passes everything
     else through unchanged, runs ``op(*per_branch_args, **kwargs)`` on the
     branch's green-context-backed stream, and concatenates outputs.
 
@@ -232,9 +222,6 @@ def _register_localizable_op(
             ``torch.ops.aten.linear.default``.
         localized_args: positions of args that are pre-localized into
             ``_LocalizedTensor`` halves (typically weight, bias).
-        sliced_args: positions of args that should be sliced per-branch
-            but not pool-localized (typically per-output-channel scales
-            or zero-points for quantized linears).
         arg_names: the op's parameter names, in signature order, so args
             passed by keyword can be matched to the positions above.
             Defaults to the names in ``op``'s schema; pass explicitly for
@@ -260,7 +247,6 @@ def _register_localizable_op(
         )
     _LOCALIZABLE_OPS[op] = _LocalizableOpMeta(
         localized_args=tuple(localized_args),
-        sliced_args=tuple(sliced_args),
         arg_names=tuple(arg_names),
         module_type=module_type,
     )
@@ -442,8 +428,6 @@ class _LocalizedTensor(torch.Tensor):
         passed it positionally or by keyword:
           - ``localized_args``: must be ``None`` or a ``_LocalizedTensor``;
             the matching half is substituted.
-          - ``sliced_args``: ``None``, ``Tensor``, or ``List[Tensor]``;
-            split along ``dim 0`` (or replicated if empty/None).
           - everything else: passed through unchanged.
 
         A registered position the caller omitted reads as ``None`` and is
@@ -451,7 +435,7 @@ class _LocalizedTensor(torch.Tensor):
 
         Output halves are concatenated along ``dim -1``.
         """
-        localized_args, sliced_args = meta.localized_args, meta.sliced_args
+        localized_args = meta.localized_args
 
         # How the caller passed each registered position: by keyword (the
         # name), or positionally (None, meaning args[i]).  A position the
@@ -460,7 +444,7 @@ class _LocalizedTensor(torch.Tensor):
         # keyword is handed back to the branch under that same keyword
         # rather than appended at a positional index someone else owns.
         keyword_of: dict[int, str | None] = {}
-        for i in (*localized_args, *sliced_args):
+        for i in localized_args:
             if i < len(args):
                 keyword_of[i] = None
             elif i < len(meta.arg_names) and meta.arg_names[i] in kwargs:
@@ -509,39 +493,6 @@ class _LocalizedTensor(torch.Tensor):
                 )
             localized_halves[i] = list(v._halves)
 
-        # Pre-split sliced_args along dim 0.
-        sliced_per_branch: dict[int, list[Any]] = {}
-        for i in sliced_args:
-            v = value_of(i)
-            if v is None:
-                sliced_per_branch[i] = [None] * n_branches
-            elif isinstance(v, torch.Tensor):
-                sliced_per_branch[i] = list(torch.tensor_split(v, n_branches, dim=0))
-            elif isinstance(v, (list, tuple)) and len(v) == 0:
-                empty: Any = [] if isinstance(v, list) else ()
-                sliced_per_branch[i] = [empty for _ in range(n_branches)]
-            elif isinstance(v, (list, tuple)):
-                # List[Tensor]: slice each element, transpose to per-branch.
-                per_branch: list[list[Any]] = [[] for _ in range(n_branches)]
-                for t in v:
-                    splits = (
-                        list(torch.tensor_split(t, n_branches, dim=0))
-                        if isinstance(t, torch.Tensor)
-                        else [t] * n_branches
-                    )
-                    for b in range(n_branches):
-                        per_branch[b].append(splits[b])
-                sliced_per_branch[i] = [type(v)(p) for p in per_branch]
-            else:
-                raise TypeError(
-                    f"{func} arg {i} must be None, Tensor, or list/tuple of "
-                    f"Tensors for sliced_args; got {type(v).__name__}"
-                )
-
-        # Every position we substitute per branch.  Localized takes precedence
-        # if a position is registered as both.
-        substitutions: dict[int, list[Any]] = {**sliced_per_branch, **localized_halves}
-
         # Mark non-localized inputs as ready on the calling stream so each
         # branch can wait on this event before reading them.
         caller_stream = torch.cuda.current_stream(primary._ctx.device)
@@ -556,7 +507,7 @@ class _LocalizedTensor(torch.Tensor):
             # kwargs the caller passed them in.
             per_branch_args = list(args)
             per_branch_kwargs = dict(kwargs)
-            for i, per_branch in substitutions.items():
+            for i, per_branch in localized_halves.items():
                 if i not in keyword_of:
                     continue
                 keyword = keyword_of[i]
