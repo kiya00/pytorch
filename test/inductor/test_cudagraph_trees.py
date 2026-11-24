@@ -548,6 +548,24 @@ if HAS_CUDA_AND_TRITON:
                     self.assertEqual(opt(pool, x), expected)
                 self.assertIsNotNone(self.get_manager())
 
+        @parametrize("return_pool_tensor", (False, True))
+        def test_registered_mempool_fast_path_assert(self, return_pool_tensor):
+            # check_memory_pool only falls back to its slow path (which starts
+            # with gc.collect) when the private pool does not hold exactly the
+            # tracked outputs, e.g. when an output lives in the registered pool.
+            def fn(pool, x):
+                with torch.cuda.use_mem_pool(pool):
+                    y = x + 1
+                return y if return_pool_tensor else y + 1
+
+            with self._registered_mempool() as pool, self._cudagraph_asserts(True):
+                opt = torch.compile(fn, mode="reduce-overhead", fullgraph=True)
+                with mock.patch("torch._inductor.cudagraph_trees.gc", wraps=gc) as m:
+                    for _ in range(3):
+                        torch.compiler.cudagraph_mark_step_begin()
+                        opt(pool, torch.ones(16, device="cuda"))
+                self.assertEqual(m.collect.called, return_pool_tensor)
+
         def test_unregistered_mempool_disables_cudagraphs(self):
             def fn(pool, x):
                 with torch.cuda.use_mem_pool(pool):
