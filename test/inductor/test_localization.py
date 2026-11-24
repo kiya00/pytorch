@@ -685,10 +685,18 @@ class TestLocalizableOpRegistryCustomOp(TestCase):
             def forward(self, x):
                 return F.linear(x, self.weight, self.bias)
 
-        m = _Overridden(64, 128).cuda()
-        with torch.inference_mode():
-            torch.cuda.localize(m)
-        self.assertFalse(_is_localized_tensor(m.weight))
+        from torch._dynamo.utils import warn_once_cache
+
+        warn_once_cache.clear()
+        m = nn.Sequential(*(_Overridden(64, 128) for _ in range(3))).cuda()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with torch.inference_mode():
+                torch.cuda.localize(m)
+        self.assertFalse(any(_is_localized_tensor(c.weight) for c in m))
+        relevant = [w for w in caught if "_Overridden" in str(w.message)]
+        self.assertEqual(len(relevant), 1)
+        self.assertEqual(relevant[0].filename, __file__)
 
 
 class _ChannelScaledLinear(nn.Module):

@@ -692,8 +692,9 @@ def localize(module: nn.Module) -> nn.Module:
     :func:`copy.deepcopy`; save or copy the model before localizing it.
 
     Unregistered module types, and registered ones that are already
-    localized, are left alone.  The same ``module`` object is returned for
-    chaining.
+    localized, are left alone.  A subclass that overrides the stock ``forward``
+    is skipped with a warning, once per subclass.  The same ``module`` object
+    is returned for chaining.
 
     Localization and subsequent forward calls must run inside
     :func:`torch.inference_mode`. Calling :func:`localize` outside inference
@@ -805,6 +806,14 @@ def localize(module: nn.Module) -> nn.Module:
             # raw-pointer custom kernels (no contiguous storage), or weight
             # reparameterization -- so skip anything not inheriting it verbatim.
             if type(child).forward is not module_type.forward:
+                from torch._dynamo.utils import warn_once
+
+                warn_once(
+                    f"localize() is skipping {type(child).__name__}: it overrides "
+                    f"{module_type.__name__}.forward, so its parameters stay "
+                    "unlocalized.",
+                    stacklevel=2,
+                )
                 continue
             for name in param_names:
                 if is_parametrized(child, name):

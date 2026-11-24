@@ -121,8 +121,10 @@ down others.
 #### Localized parameters are read-only
 
 Load, modify or convert weights (`load_state_dict`, in-place updates, `.half()`,
-`.to()`) before calling `torch.cuda.localize`. A localized module or its
-`state_dict()` cannot be saved with `torch.save` or copied with
+`.to()`) before calling `torch.cuda.localize`. In-place updates of the parameter
+raise an error, but views and slices of it (`w[:5]`, `w.t()`) are copies, so
+writing through them silently does not change the parameter. A localized module
+or its `state_dict()` cannot be saved with `torch.save` or copied with
 `copy.deepcopy`; save or copy the model before localizing it.
 
 #### Numerics change
