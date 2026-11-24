@@ -2358,12 +2358,11 @@ def check_memory_pool(
     }
 
     # check if there is a divergence first, then do the expensive snapshot call after
-    # we know it will error. The fast path checks a single pool exactly, so it only
-    # applies when there is one managed pool.
+    # we know it will error. The private pool (pool_ids[0]) is exclusive to
+    # cudagraphs, so if it holds exactly the tracked storages, the registered
+    # external pools cannot make the check below fail either.
     allocator = tree_backend.get_allocator_interface()
-    if len(pool_ids) == 1 and allocator.check_pool_live_allocations(
-        device, pool_ids[0], unique_storages
-    ):
+    if allocator.check_pool_live_allocations(device, pool_ids[0], unique_storages):
         return
 
     # at this point we are past the fast-path. we have seen rare cases where a dead tensor is dead,
