@@ -332,6 +332,7 @@ def cudagraph_post_compile(
             mutated_input_idxs=tuple(compiled_graph.mutated_input_idxs),
             kernel_free_cudagraph=compiled_graph.kernel_free_cudagraph,
             user_visible_output_idxs=tuple(user_visible_output_idxs),
+            mempool_indices=compiled_graph.cudagraph_mempool_indices,
         )
 
         policy = config.cudagraph_policy
@@ -467,6 +468,7 @@ def cudagraph_partition_post_compile(
             mutated_input_idxs=tuple(partition_metadata.mutated_input_idxs),
             kernel_free_cudagraph=compiled_graph.kernel_free_cudagraph,
             user_visible_output_idxs=tuple(partition_metadata.user_visible_output_idxs),
+            mempool_indices=compiled_graph.cudagraph_mempool_indices,
         )
         cudagraphify_fns.append(cudagraphify_fn)
 
@@ -598,6 +600,7 @@ class CompiledFxGraph(OutputCode):
     inductor_provenance_mapping_str: str | None
     inductor_provenance_stack_traces_str: str | None
     kernel_free_cudagraph: bool
+    cudagraph_mempool_indices: tuple[int, ...]
 
     cudagraph_info: CudagraphCachedInfo | None
     partition_maps: list[GraphPartitionMap] | None
@@ -695,6 +698,7 @@ class CompiledFxGraph(OutputCode):
         self.output_strides = output_strides
         self.disabled_cudagraphs_reason = disabled_cudagraphs_reason
         self.kernel_free_cudagraph = graph.kernel_free_cudagraph
+        self.cudagraph_mempool_indices = tuple(graph.cudagraph_mempool_indices)
         self.metrics_deltas = metrics_deltas
         self.counter_deltas = counter_deltas
         self.guards_expr = None

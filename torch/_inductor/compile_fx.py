@@ -2282,6 +2282,7 @@ def cudagraphify(
     mutated_input_idxs: tuple[int, ...] = (),
     kernel_free_cudagraph: bool = False,
     user_visible_output_idxs: tuple[int, ...] = (),
+    mempool_indices: tuple[int, ...] = (),
 ) -> Callable[..., Any]:
     cudagraphify_fn: Callable[..., Any]
     if config.triton.cudagraph_trees:
@@ -2313,6 +2314,7 @@ def cudagraphify(
             mutated_input_idxs=mutated_input_idxs,
             kernel_free_cudagraph=kernel_free_cudagraph,
             user_visible_output_idxs=user_visible_output_idxs,
+            mempool_indices=mempool_indices,
             cudagraph_managed_input_rerecord_limit=managed_input_rerecord_limit,
             cudagraph_managed_input_rerecord_action=managed_input_rerecord_action,
             cudagraph_initial_mempool_allocation_gb=(

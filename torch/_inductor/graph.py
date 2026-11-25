@@ -614,6 +614,8 @@ class GraphLowering(torch.fx.Interpreter):
         # aot_inductor.cudagraphs rejects such graphs.
         self.input_as_strided_node: torch.fx.Node | None = None
         self.kernel_free_cudagraph: bool = False
+        # External object indices of the _CudagraphManagedMemPools the graph uses.
+        self.cudagraph_mempool_indices: OrderedSet[int] = OrderedSet()
         # How this compile is split into partitions, and what for. Without a
         # plan it follows config.graph_partition, which is patched off during
         # cpp_wrapper/fx_wrapper/AOT lowering (maybe_disable_graph_partition).
@@ -2002,6 +2004,20 @@ class GraphLowering(torch.fx.Interpreter):
             return None
         return custom["mempool"], custom["mempool_device"]
 
+    @staticmethod
+    def _mempool_is_cudagraph_managed(node_mempool: tuple[int, int]) -> bool:
+        """True if cudagraph trees can manage the user MemPool of a node.
+
+        ``node_mempool`` is ``(user_object_index, device)``.
+        """
+        from torch._dynamo.graph_bytecode_inputs import get_external_object_by_index
+        from torch._inductor.cudagraph_trees import _CudagraphManagedMemPool
+
+        pool = get_external_object_by_index(node_mempool[0])
+        return config.triton.cudagraph_trees and isinstance(
+            pool, _CudagraphManagedMemPool
+        )
+
     def _realize_inputs_at_context_boundaries(self, n: torch.fx.Node) -> None:
         """Realize IR inputs that are in a different stream or mempool context.
 
@@ -2077,13 +2093,15 @@ class GraphLowering(torch.fx.Interpreter):
             origins |= gather_origins(args, kwargs)
             self._realize_inputs_at_context_boundaries(n)
         node_mempool = self._get_node_mempool(n)
-        if node_mempool is not None and self.disable_cudagraphs_reason is None:
-            # User MemPool regions must route allocations to the explicit pool.
-            # CUDA graphs use a private capture pool, so capture would violate
-            # that routing and trip cudagraph memory-pool assertions.
-            self.disable_cudagraphs_reason = (
-                "user CUDA MemPool contexts are not compatible with CUDA graphs"
-            )
+        if node_mempool is not None:
+            if self._mempool_is_cudagraph_managed(node_mempool):
+                self.cudagraph_mempool_indices.add(node_mempool[0])
+            elif self.disable_cudagraphs_reason is None:
+                # Capture allocates from the private pool, which breaks routing to
+                # an explicit user pool unless cudagraph trees manage that pool.
+                self.disable_cudagraphs_reason = (
+                    "user CUDA MemPool contexts are not compatible with CUDA graphs"
+                )
         with (
             ir.IRNode.current_origins(origins),
             ir.IRNode.current_stream_idx(self._get_node_stream(n)),

@@ -8,6 +8,7 @@ import itertools
 import os
 import re
 import sys
+import threading
 import unittest
 import warnings
 import weakref
@@ -25,6 +26,7 @@ from torch._inductor import config, lowering
 from torch._inductor.codecache import FxGraphCache
 from torch._inductor.compile_fx import compile_fx_inner
 from torch._inductor.cudagraph_trees import (
+    _CudagraphManagedMemPool,
     AliasesPriorGraphOutput,
     cudagraphify_impl as tree_cudagraphify_impl,
     ExecutionState,
@@ -508,6 +510,168 @@ if HAS_CUDA_AND_TRITON:
 
         def num_checkpoints(self):
             return self.get_manager().debug_checkpointing_counter
+
+        @staticmethod
+        def _cudagraph_asserts(enabled):
+            return config.patch(
+                {
+                    "triton.slow_path_cudagraph_asserts": enabled,
+                    "triton.fast_path_cudagraph_asserts": enabled,
+                }
+            )
+
+        @staticmethod
+        def _add_one_in_pool(pool, x):
+            with torch.cuda.use_mem_pool(pool):
+                return x + 1
+
+        @parametrize("asserts", (False, True))
+        @parametrize("return_pool_tensor", (False, True))
+        def test_managed_mempool(self, asserts, return_pool_tensor):
+            # Allocating from a managed pool inside a captured region, including
+            # a cudagraph output that lives in the pool, keeps cudagraphs enabled.
+            def fn(pool, x):
+                with torch.cuda.use_mem_pool(pool):
+                    y = x + 1
+                return y if return_pool_tensor else y + 1
+
+            pool = _CudagraphManagedMemPool()
+            with self._cudagraph_asserts(asserts):
+                opt = torch.compile(fn, mode="reduce-overhead", fullgraph=True)
+                for i in range(3):
+                    torch.compiler.cudagraph_mark_step_begin()
+                    x = torch.full((16,), float(i), device="cuda")
+                    expected = x + 1 if return_pool_tensor else x + 2
+                    self.assertEqual(opt(pool, x), expected)
+            self.assertIn(pool.id, self.get_manager().external_pools)
+
+        @parametrize("return_pool_tensor", (False, True))
+        def test_managed_mempool_fast_path_assert(self, return_pool_tensor):
+            # check_memory_pool only falls back to its slow path (which starts
+            # with gc.collect) when the private pool does not hold exactly the
+            # tracked outputs, e.g. when an output lives in the managed pool.
+            def fn(pool, x):
+                with torch.cuda.use_mem_pool(pool):
+                    y = x + 1
+                return y if return_pool_tensor else y + 1
+
+            pool = _CudagraphManagedMemPool()
+            with self._cudagraph_asserts(True):
+                opt = torch.compile(fn, mode="reduce-overhead", fullgraph=True)
+                with mock.patch("torch._inductor.cudagraph_trees.gc", wraps=gc) as m:
+                    for _ in range(3):
+                        torch.compiler.cudagraph_mark_step_begin()
+                        opt(pool, torch.ones(16, device="cuda"))
+                self.assertEqual(m.collect.called, return_pool_tensor)
+
+        def test_unmanaged_mempool_disables_cudagraphs(self):
+            pool = torch.cuda.MemPool()
+            x = torch.ones(16, device="cuda")
+            opt = torch.compile(self._add_one_in_pool, mode="reduce-overhead")
+            self.assertEqual(opt(pool, x), x + 1)
+            self.assertIsNone(self.get_manager())
+
+        @parametrize("asserts", (False, True))
+        def test_managed_mempool_checkpoint(self, asserts):
+            # A live allocation made in a managed pool before the first recording
+            # survives the checkpoint restores at tree branches and is not
+            # reported as a leak.
+            pool = _CudagraphManagedMemPool()
+            first = torch.compile(self._add_one_in_pool, mode="reduce-overhead")
+            branches = [
+                torch.compile(lambda y: y * 2, mode="reduce-overhead"),
+                torch.compile(lambda y: y - 1, mode="reduce-overhead"),
+            ]
+            x = torch.ones(5, device="cuda")
+            with self._cudagraph_asserts(asserts):
+                with torch.cuda.use_mem_pool(pool):
+                    persistent = torch.ones(8, device="cuda")
+                for branch, expected in zip(branches, (4.0, 1.0)):
+                    for _ in range(3):
+                        torch.compiler.cudagraph_mark_step_begin()
+                        out = branch(first(pool, x))
+                        self.assertEqual(out, torch.full_like(x, expected))
+                self.assertGreater(self.num_checkpoints(), 0)
+                self.assertEqual(persistent, torch.ones(8, device="cuda"))
+
+        @parametrize("asserts", (False, True))
+        def test_managed_mempool_added_after_recording(self, asserts):
+            # A pool first seen after the tree has recorded nodes is restored to
+            # its baseline when the manager returns to those nodes.
+            pool = _CudagraphManagedMemPool()
+            f = torch.compile(lambda x: x.sin(), mode="reduce-overhead")
+            g = torch.compile(self._add_one_in_pool, mode="reduce-overhead")
+            x = torch.randn(16, device="cuda")
+            with self._cudagraph_asserts(asserts):
+                for _ in range(3):
+                    torch.compiler.cudagraph_mark_step_begin()
+                    f(x)
+                manager = self.get_manager()
+                self.assertEqual(manager.external_pools, {})
+                apply = type(manager).apply_checkpoint_execution_state_in_allocator
+                baseline_restores = 0
+
+                def counting_apply(manager):
+                    nonlocal baseline_restores
+                    states = manager.current_node.checkpointed_caching_states
+                    baseline_restores += pool.id not in states
+                    return apply(manager)
+
+                with mock.patch.object(
+                    type(manager),
+                    "apply_checkpoint_execution_state_in_allocator",
+                    counting_apply,
+                ):
+                    for i in range(6):
+                        torch.compiler.cudagraph_mark_step_begin()
+                        if i % 2:
+                            a, b = f(x), g(pool, x)
+                        else:
+                            b, a = g(pool, x), f(x)
+                        self.assertEqual(a, x.sin())
+                        self.assertEqual(b, x + 1)
+            self.assertIn(pool.id, manager.external_pools)
+            self.assertGreater(baseline_restores, 0)
+
+        @config.patch({"fx_graph_cache": True, "force_disable_caches": False})
+        def test_managed_mempool_cache_hit_with_unmanaged_pool(self):
+            # The graph lowered for a managed pool is cached; reusing it with a
+            # plain MemPool runs eagerly instead of capturing that pool.
+            x = torch.ones(16, device="cuda")
+            for pool in (_CudagraphManagedMemPool(), torch.cuda.MemPool()):
+                torch._dynamo.reset()
+                counters.clear()
+                opt = torch.compile(self._add_one_in_pool, mode="reduce-overhead")
+                for _ in range(3):
+                    torch.compiler.cudagraph_mark_step_begin()
+                    self.assertEqual(opt(pool, x), x + 1)
+            self.assertEqual(counters["inductor"]["fxgraph_cache_hit"], 1)
+            self.assertEqual(counters["inductor"]["cudagraph_skips"], 1)
+
+        def test_managed_mempool_not_shared_with_other_threads(self):
+            # Only the manager whose graphs use a pool manages it, so a thread
+            # without such graphs keeps its own tree untouched.
+            pool = _CudagraphManagedMemPool()
+            g = torch.compile(self._add_one_in_pool, mode="reduce-overhead")
+            x = torch.ones(16, device="cuda")
+            for _ in range(3):
+                torch.compiler.cudagraph_mark_step_begin()
+                self.assertEqual(g(pool, x), x + 1)
+
+            f = torch.compile(lambda t: t.cos(), mode="reduce-overhead")
+            other_pools = []
+
+            def worker():
+                for _ in range(3):
+                    torch.compiler.cudagraph_mark_step_begin()
+                    f(x)
+                other_pools.append(dict(self.get_manager().external_pools))
+
+            thread = threading.Thread(target=worker)
+            thread.start()
+            thread.join()
+            self.assertEqual(other_pools, [{}])
+            self.assertIn(pool.id, self.get_manager().external_pools)
 
         def test_run_simple(self):
             def foo(x):
