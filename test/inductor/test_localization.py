@@ -1087,6 +1087,74 @@ class TestLocalizationCudagraphs(TestCase):
 
     @_requires_green_contexts
     @torch.inference_mode()
+    @parametrize(
+        "caller",
+        ("eager", "no_cudagraphs", "cudagraph_skip", "uncaptured_size", "aot_eager"),
+    )
+    def test_call_concurrent_with_replay(self, device, caller):
+        # A localized call that does not replay a CUDA graph must not get the
+        # blocks a concurrent replay on another stream writes to.
+        from torch._inductor.cudagraph_trees import get_container
+
+        model = nn.Linear(8, 8, bias=False, device=device)
+        model.weight.fill_(1)
+        x1 = torch.ones(4, 8, device=device)
+        x2 = torch.zeros_like(x1)
+        torch.cuda.localize(model)
+        graphed = torch.compile(model, mode="reduce-overhead", fullgraph=True)
+        # Under reduce-overhead, a dynamic graph is either skipped by cudagraphs
+        # or, for a size not in cudagraph_capture_sizes, run without capture.
+        fn = {
+            "eager": model,
+            "no_cudagraphs": torch.compile(
+                model, fullgraph=True, options={"triton.cudagraphs": False}
+            ),
+            "cudagraph_skip": torch.compile(
+                lambda x: model(x), mode="reduce-overhead", dynamic=True
+            ),
+            "uncaptured_size": torch.compile(
+                lambda x: model(x), mode="reduce-overhead", dynamic=True
+            ),
+            "aot_eager": torch.compile(model, backend="aot_eager"),
+        }[caller]
+        config = {
+            "triton.cudagraph_skip_dynamic_graphs": caller == "cudagraph_skip",
+            # TODO: graph partitions break localization's stream codegen.
+            "graph_partition": caller != "cudagraph_skip",
+            "triton.cudagraph_capture_sizes": (
+                (None, 6) if caller == "uncaptured_size" else None
+            ),
+        }
+        replay_stream, call_stream = torch.cuda.Stream(), torch.cuda.Stream()
+        replay_stream.wait_stream(torch.cuda.current_stream())
+        call_stream.wait_stream(torch.cuda.current_stream())
+        with inductor_config.patch(config):
+            with torch.cuda.stream(replay_stream):
+                for _ in range(3):
+                    torch.compiler.cudagraph_mark_step_begin()
+                    graphed(x2)
+            with torch.cuda.stream(call_stream):
+                for _ in range(3):
+                    fn(x1)
+            torch.cuda.synchronize()
+            # Delay the call's cat past a replay on another stream: the replay
+            # must not write to the call's branch outputs.
+            delay = int(50 * get_cycles_per_ms())
+            with torch.cuda.stream(model.weight._streams[1]):
+                torch.cuda._sleep(2 * delay)
+            with torch.cuda.stream(call_stream):
+                out = fn(x1)
+            with torch.cuda.stream(replay_stream):
+                torch.cuda._sleep(delay)
+                torch.compiler.cudagraph_mark_step_begin()
+                replayed = graphed(x2)
+            torch.cuda.synchronize()
+        self.assertEqual(out, torch.full_like(out, 8))
+        self.assertEqual(replayed, torch.zeros_like(replayed))
+        self.assertTrue(get_container(x1.device.index).tree_manager.external_pools)
+
+    @_requires_green_contexts
+    @torch.inference_mode()
     @inductor_config.patch("triton.slow_path_cudagraph_asserts", True)
     def test_localize_after_replay(self, device):
         from torch._inductor.cudagraph_trees import get_container
@@ -1227,7 +1295,10 @@ class TestLocalizationAllocatorMeta(TestCase):
     @_requires_green_contexts
     def test_output_code_wraps_per_branch_allocations(self):
         """The inductor wrapper emits ``with torch.cuda.use_mem_pool(...)``
-        around the per-branch ``empty_strided_cuda`` calls."""
+        around the per-branch ``empty_strided_cuda`` calls.
+
+        The pool is looked up on every call, which cudagraph trees rely on to
+        route their recordings to each pool's ``cudagraph_pool``."""
         from torch._inductor.utils import run_and_get_code
 
         model = _LinearReLU(4096, 4096, bias=False).cuda().eval().to(torch.bfloat16)

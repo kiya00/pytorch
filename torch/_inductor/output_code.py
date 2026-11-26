@@ -228,9 +228,39 @@ def prepare_cudagraph_post_compile(
         boxed_forward_device_index.set(compiled_graph.device_index())
 
 
+def _get_mempool_cudagraph_fail_reason(compiled_graph: CompiledFxGraph) -> str | None:
+    """Only cudagraph trees can manage the MemPools a graph allocates from, and only
+    localization pools. Decided on every post_compile rather than in lowering, as an
+    FX graph cache entry is the same whatever the types of its pools.
+    """
+    indices = compiled_graph.cudagraph_mempool_indices
+    if not indices:
+        return None
+    from torch._dynamo.graph_bytecode_inputs import (
+        get_external_object_by_index,
+        install_active_registry,
+    )
+    from torch.cuda.memory import _LocalizationMemPool
+
+    if config.triton.cudagraph_trees and config.cudagraph_policy is None:
+        install_active_registry()
+        try:
+            pools = [get_external_object_by_index(i) for i in indices]
+        except AssertionError:
+            # Not compiled within its trace, e.g. a lazily compiled backward.
+            pools = []
+        if pools and all(isinstance(p, _LocalizationMemPool) for p in pools):
+            return None
+    return format_default_skip_message(
+        "user CUDA MemPool contexts are not compatible with CUDA graphs"
+    )
+
+
 def _get_runtime_cudagraph_fail_reason(
     compiled_graph: CompiledFxGraph,
 ) -> str | None:
+    if reason := _get_mempool_cudagraph_fail_reason(compiled_graph):
+        return reason
     if config.cudagraph_policy is not None:
         return None
 

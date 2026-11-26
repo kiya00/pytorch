@@ -60,6 +60,8 @@ from torch._custom_class_base import CustomClassBase
 from torch._dynamo.callback import CallbackTrigger
 from torch._dynamo.graph_bytecode_inputs import (
     CURRENT_STREAM_INDEX,
+    get_external_object_by_index,
+    index_to_external_object_weakref,
     set_external_object_by_index,
 )
 from torch._dynamo.mutation_guard import GenerationTracker
@@ -88,6 +90,7 @@ from torch._inductor.cudagraph_utils import (
     WrappedFunction,
 )
 from torch._library.opaque_object import is_custom_class_obj
+from torch.cuda.memory import _LocalizationMemPool
 from torch.multiprocessing.reductions import StorageWeakRef
 from torch.storage import UntypedStorage
 from torch.utils import _pytree as pytree
@@ -318,29 +321,6 @@ def mark_warmup_incomplete() -> None:
         manager.mark_warmup_incomplete()
 
 
-class _CudagraphManagedMemPool(torch.cuda.MemPool):
-    """A MemPool that cudagraph trees manage like their private pool.
-
-    Private to torch.cuda.localize, which allocates per-branch outputs from these
-    pools inside compiled regions. A plain MemPool in a compiled region disables
-    cudagraphs; for this pool, the tree manager running the graph instead adds it
-    to the pools it checkpoints and restores, so the graph can be captured.
-
-    Restoring a checkpoint frees every allocation made in the pool after it, so
-    the pool must only hold allocations of compiled graphs (or short-lived eager
-    ones) and must only be used from a single thread.
-    """
-
-
-def _resolve_mempools(mempool_indices: Sequence[int]) -> list[torch.cuda.MemPool]:
-    from torch._dynamo.graph_bytecode_inputs import get_external_object_by_index
-
-    return [
-        cast(torch.cuda.MemPool, get_external_object_by_index(i))
-        for i in mempool_indices
-    ]
-
-
 def mark_running_backward(device_index: int) -> None:
     """Tell the device's manager that a backward runs, if there is a manager.
 
@@ -497,16 +477,6 @@ def cudagraphify_impl(
             )
             return run_eager(inputs)
 
-        # Lowering only allows managed pools, but a cached graph can be reused
-        # in a call that passes a plain MemPool.
-        mempools = _resolve_mempools(mempool_indices)
-        if not all(isinstance(p, _CudagraphManagedMemPool) for p in mempools):
-            log_cudagraph_skip_and_bump_counter(
-                "skipping cudagraphs due to a MemPool not managed by cudagraph trees"
-            )
-            fn_cache[int_key] = run_eager
-            return run_eager(inputs)
-
         if int_key is None:
             log.info(
                 "[%s] Recording cudagraph tree for graph without symints", compile_id
@@ -525,6 +495,12 @@ def cudagraphify_impl(
         new_static_input_idxs = remove_unaligned_input_idxs(inputs, static_input_idxs)
         copy_misaligned_inputs(inputs, check_input_idxs)
 
+        # Post-compile only keeps cudagraphs for localization pools, and Dynamo
+        # guards on the pool types.
+        mempools = [
+            cast(_LocalizationMemPool, get_external_object_by_index(i))
+            for i in mempool_indices
+        ]
         fn, out = cudagraphify(
             model, inputs, new_static_input_idxs, *args, mempools=mempools, **kwargs
         )
@@ -581,7 +557,7 @@ def cudagraphify(
     cudagraph_managed_input_rerecord_action: Literal["copy", "skip"] | None = None,
     cudagraph_initial_mempool_allocation_gb: float | None = None,
     compile_id: CompileId | None = None,
-    mempools: Sequence[torch.cuda.MemPool] = (),
+    mempools: Sequence[_LocalizationMemPool] = (),
 ) -> tuple[ModelType, OutputType]:
     if is_backward and is_inference:
         raise AssertionError("expected not (is_backward and is_inference)")
@@ -754,11 +730,27 @@ def _update_current_stream_external_object() -> Generator[None, None, None]:
     trace-time default stream.  The external object at CURRENT_STREAM_INDEX
     must reflect the actual current stream so that custom ops (e.g. event
     record/wait) executed during capture use the right stream.
+
+    It also swaps each _LocalizationMemPool for its cudagraph_pool, the only time
+    anything allocates from the latter (see _LocalizationMemPool), and swaps it
+    back afterwards for non-cudagraph code that runs in the same call.
     """
     set_external_object_by_index(
         CURRENT_STREAM_INDEX, torch.accelerator.current_stream()
     )
-    yield
+    swapped = [
+        (i, ref)
+        for i, ref in enumerate(index_to_external_object_weakref)
+        if isinstance(ref(), _LocalizationMemPool)
+    ]
+    for i, ref in swapped:
+        pool = cast(_LocalizationMemPool, ref())
+        index_to_external_object_weakref[i] = weakref.ref[object](pool.cudagraph_pool)
+    try:
+        yield
+    finally:
+        for i, ref in swapped:
+            index_to_external_object_weakref[i] = ref
 
 
 def map_to_ref(t: Tensor | None) -> StorageWeakRefWrapper | None:
@@ -2522,11 +2514,11 @@ class CUDAGraphTreeManager:
         # shared by all this manager's nodes; see _LivenessCheckState
         self.liveness_check_state = _LivenessCheckState()
 
-        # External pools the graphs of this manager allocate from, with the
-        # allocator state of each pool when the manager first saw it. Holding the
-        # pool keeps it alive while nodes reference its id.
+        # The cudagraph_pool of each localization pool the graphs of this manager
+        # allocate from, with its allocator state when the manager first saw it.
+        # Holding the localization pool keeps it alive while nodes reference the id.
         self.external_pools: dict[
-            tuple[int, int], tuple[torch.cuda.MemPool, tree_backend.AllocatorState]
+            tuple[int, int], tuple[_LocalizationMemPool, tree_backend.AllocatorState]
         ] = {}
 
         # NB: cuda caching allocator will remember the stream a segment is allocated to
@@ -3081,18 +3073,28 @@ class CUDAGraphTreeManager:
         compile_id: CompileId | None,
         cudagraph_managed_input_rerecord_limit: int,
         cudagraph_managed_input_rerecord_action: Literal["copy", "skip"],
-        mempools: Sequence[torch.cuda.MemPool],
+        mempools: Sequence[_LocalizationMemPool],
     ) -> tuple[
         ModelType,
         OutputType,
     ]:
         allocator = tree_backend.get_allocator_interface()
         for pool in mempools:
-            if pool.id not in self.external_pools:
-                # Nodes recorded before this pool showed up restore it to this state,
-                # which holds none of this manager's allocations.
-                baseline = allocator.get_checkpoint_state(self.device_index, pool.id)
-                self.external_pools[pool.id] = (pool, baseline)
+            pool_id = pool.cudagraph_pool.id
+            if pool_id in self.external_pools:
+                continue
+            owner = pool.tree_manager() if pool.tree_manager is not None else None
+            if owner is not None and owner is not self and owner.graph is not None:
+                raise RuntimeError(
+                    "A localization MemPool is already used by the CUDA graphs of "
+                    "another thread. torch.cuda.localize supports running a "
+                    "localized model's CUDA graphs from a single thread only."
+                )
+            pool.tree_manager = weakref.ref(self)
+            # Nodes recorded before this pool showed up restore it to this state,
+            # which holds none of this manager's allocations.
+            baseline = allocator.get_checkpoint_state(self.device_index, pool_id)
+            self.external_pools[pool_id] = (pool, baseline)
         id = self.new_func_id()
         if mode == CompilationMode.BACKWARD:
             user_visible_output_idxs = ()

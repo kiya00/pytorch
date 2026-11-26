@@ -136,7 +136,7 @@ class _LocalizationContext:
             GreenContext,
             is_localization_supported,
         )
-        from torch.cuda.memory import LocalizedAllocator
+        from torch.cuda.memory import _LocalizationMemPool, LocalizedAllocator
 
         if not is_localization_supported(device):
             raise RuntimeError(
@@ -149,15 +149,12 @@ class _LocalizationContext:
         gcs = GreenContext.split(
             locality_domain_ids=tuple(range(num_domains)), device_id=device
         )
-        from torch._inductor.cudagraph_trees import _CudagraphManagedMemPool
-
-        # Only the branch pools are managed by cudagraph trees: a checkpoint restore
-        # must never free weight halves, which live in the plain weight_pools.
         # Native pools belong to the current device, independently of allocator.device_id.
         with torch.cuda.device(device):
             pools = [
-                _CudagraphManagedMemPool(
-                    LocalizedAllocator(i, device=device).allocator()
+                _LocalizationMemPool(
+                    LocalizedAllocator(i, device=device).allocator(),
+                    LocalizedAllocator(i, device=device).allocator(),
                 )
                 for i in range(num_domains)
             ]
@@ -674,6 +671,8 @@ def localize(
         unsupported.
         Custom localizable ops must not retain temporary allocations made
         inside their per-branch execution pools after the call returns.
+        Localized modules, eager or compiled, must only be called from a
+        single thread.
 
     Args:
         module: the module (or model) to walk. Mutated in place.

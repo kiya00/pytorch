@@ -31,6 +31,8 @@ from .green_contexts import get_num_locality_domains, is_localization_supported
 
 
 if TYPE_CHECKING:
+    import weakref
+
     from torch.types import Device
 
 
@@ -1843,6 +1845,29 @@ class LocalizedAllocator(_CUDAAllocator):
     def device_id(self) -> int:
         r"""Return the CUDA device index associated with this allocator."""
         return self._localized_allocator.device_id
+
+
+class _LocalizationMemPool(MemPool):
+    r"""Pool for the branch outputs of :func:`torch.cuda.localize` code.
+
+    A plain MemPool in a compiled region disables CUDA graphs. For this pool,
+    CUDA Graph Trees instead route the allocations of their warmups and
+    recordings to ``cudagraph_pool`` and manage it like their private pool. A
+    replay writes to the blocks a recording allocated while the allocator holds
+    them as free, so nothing else may allocate from ``cudagraph_pool``; every
+    other execution, eager or compiled, uses this pool itself.
+
+    ``tree_manager`` is the one tree manager that manages ``cudagraph_pool``.
+    """
+
+    def __init__(
+        self,
+        allocator: _cuda_CUDAAllocator | None = None,
+        cudagraph_allocator: _cuda_CUDAAllocator | None = None,
+    ) -> None:
+        super().__init__(allocator)
+        self.cudagraph_pool = MemPool(cudagraph_allocator)
+        self.tree_manager: weakref.ReferenceType[Any] | None = None
 
 
 @contextlib.contextmanager
