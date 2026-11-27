@@ -2327,9 +2327,9 @@ def check_memory_pool(
 ) -> None:
     """Validate managed-pool allocations vs tracked live storages, surfacing leaks.
 
-    ``pool_ids`` is the set of pools cudagraph_trees manages together (the private
-    capture pool plus any registered external pools); a tracked live storage is
-    valid if it lives in any one of them.
+    ``pool_ids`` is the private capture pool followed by the cudagraph_pool of each
+    localization pool the manager uses; a tracked live storage is valid if it
+    lives in any one of them.
     """
     if not all(isinstance(elem, StorageWeakRefWrapper) for elem in live_storages_ptrs):
         raise AssertionError(
@@ -2340,9 +2340,9 @@ def check_memory_pool(
     }
 
     # check if there is a divergence first, then do the expensive snapshot call after
-    # we know it will error. The private pool (pool_ids[0]) is exclusive to
-    # cudagraphs, so if it holds exactly the tracked storages, the registered
-    # external pools cannot make the check below fail either.
+    # we know it will error. If the private pool (pool_ids[0]) holds exactly the
+    # tracked storages, the other pools cannot make the check below fail either,
+    # as only the private pool reports leaks.
     allocator = tree_backend.get_allocator_interface()
     if allocator.check_pool_live_allocations(device, pool_ids[0], unique_storages):
         return
@@ -2354,11 +2354,11 @@ def check_memory_pool(
 
     allocated_not_in_live_storages = {}
 
-    # pool_ids[0] is the private capture pool, which is exclusive to cudagraphs so
-    # every live block in it must be a tracked output. Registered external pools
-    # (the rest) are shared with the caller and may hold allocations that are not
-    # cudagraph outputs, so we only use them to satisfy tracked storages, not to
-    # flag leaks.
+    # pool_ids[0] is the private capture pool, which only this manager allocates
+    # from, so every live block in it must be a tracked output. A localization
+    # cudagraph_pool outlives tree managers and may still hold live outputs of a
+    # reset manager that this one does not track, so it only satisfies tracked
+    # storages and does not report leaks.
     for i, pool_id in enumerate(pool_ids):
         is_exclusive_pool = i == 0
         for segment in get_cudagraph_segments(pool_id):

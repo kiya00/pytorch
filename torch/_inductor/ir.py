@@ -7535,21 +7535,12 @@ class ConcatKernel(NopKernel):
     @classmethod
     def _src_is_localized(cls, src: StorageBox) -> bool:
         r"""Require a copy for localized producers instead of aliasing cat storage."""
-        data = getattr(src, "data", None)
-        if data is None:
-            return False
         # Inspect the producer's origin, not inherited origins of the inserted
         # Pointwise copy, so recursive realize_into can place the copy in dst.
-        origin_node = (
-            data.get_origin_node() if hasattr(data, "get_origin_node") else None
-        )
+        origin_node = src.data.get_origin_node()
         if origin_node is None:
             return False
-        meta = getattr(origin_node, "meta", None)
-        if not meta:
-            return False
-        custom = meta.get("custom") or {}
-        return custom.get("localization") is True
+        return origin_node.meta.get("custom", {}).get("localization") is True
 
     @classmethod
     def realize_into(cls, src: IRNode, dst: IRNode, allow_alias: bool = True) -> IRNode:
