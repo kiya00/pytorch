@@ -2514,12 +2514,9 @@ class CUDAGraphTreeManager:
         # shared by all this manager's nodes; see _LivenessCheckState
         self.liveness_check_state = _LivenessCheckState()
 
-        # The cudagraph_pool of each localization pool the graphs of this manager
-        # allocate from, with its allocator state when the manager first saw it.
-        # Holding the localization pool keeps it alive while nodes reference the id.
-        self.external_pools: dict[
-            tuple[int, int], tuple[_LocalizationMemPool, tree_backend.AllocatorState]
-        ] = {}
+        # The localization pool of each cudagraph_pool id the graphs of this manager
+        # allocate from. Holding the pool keeps it alive while nodes reference the id.
+        self.external_pools: dict[tuple[int, int], _LocalizationMemPool] = {}
 
         # NB: cuda caching allocator will remember the stream a segment is allocated to
         # and only allocate that segment to the same stream. we need to use a single stream
@@ -3078,7 +3075,6 @@ class CUDAGraphTreeManager:
         ModelType,
         OutputType,
     ]:
-        allocator = tree_backend.get_allocator_interface()
         for pool in mempools:
             pool_id = pool.cudagraph_pool.id
             if pool_id in self.external_pools:
@@ -3091,10 +3087,7 @@ class CUDAGraphTreeManager:
                     "localized model's CUDA graphs from a single thread only."
                 )
             pool.tree_manager = weakref.ref(self)
-            # Nodes recorded before this pool showed up restore it to this state,
-            # which holds none of this manager's allocations.
-            baseline = allocator.get_checkpoint_state(self.device_index, pool_id)
-            self.external_pools[pool_id] = (pool, baseline)
+            self.external_pools[pool_id] = pool
         id = self.new_func_id()
         if mode == CompilationMode.BACKWARD:
             user_visible_output_idxs = ()
@@ -3546,15 +3539,11 @@ class CUDAGraphTreeManager:
         ]
         ptrs_to_deallocate = self.current_node.data_ptrs_dead_since_invocation()
         allocator = tree_backend.get_allocator_interface()
-        # Pools first seen after this node was recorded go back to their baseline.
-        baselines = [
-            baseline
-            for pool_id, (_, baseline) in self.external_pools.items()
-            if pool_id not in states
-        ]
-        # Each state restores only its own pool, so passing the full live-storage
-        # list to every call is safe.
-        for state in [*states.values(), *baselines]:
+        # A pool first seen after this node was recorded holds no tensor of its path,
+        # and the outputs of other paths were freed before switching to this one, so
+        # it needs no restore. Each state restores only its own pool, so passing the
+        # full live-storage list to every call is safe.
+        for state in states.values():
             allocator.set_checkpoint_pool_state(
                 device,
                 state,

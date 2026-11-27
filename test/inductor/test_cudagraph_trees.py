@@ -602,8 +602,8 @@ if HAS_CUDA_AND_TRITON:
 
         @parametrize("asserts", (False, True))
         def test_managed_mempool_added_after_recording(self, asserts):
-            # A pool first seen after the tree has recorded nodes is restored to
-            # its baseline when the manager returns to those nodes.
+            # A pool first seen after the tree has recorded nodes holds none of its
+            # blocks when the manager returns to those nodes.
             pool = _LocalizationMemPool()
             f = torch.compile(lambda x: x.sin(), mode="reduce-overhead")
             g = torch.compile(self._add_one_in_pool, mode="reduce-overhead")
@@ -620,8 +620,15 @@ if HAS_CUDA_AND_TRITON:
                 def counting_apply(manager):
                     nonlocal baseline_restores
                     states = manager.current_node.checkpointed_caching_states
-                    baseline_restores += pool.cudagraph_pool.id not in states
-                    return apply(manager)
+                    restores_baseline = pool.cudagraph_pool.id not in states
+                    apply(manager)
+                    if restores_baseline:
+                        # No tensor on the path of a node recorded before g lives in
+                        # the pool, so returning to it must leave none of g's blocks.
+                        baseline_restores += 1
+                        segments = pool.cudagraph_pool.snapshot()
+                        blocks = [b["state"] for s in segments for b in s["blocks"]]
+                        self.assertNotIn("active_allocated", blocks)
 
                 with mock.patch.object(
                     type(manager),
@@ -638,6 +645,46 @@ if HAS_CUDA_AND_TRITON:
                         self.assertEqual(b, x + 1)
             self.assertIn(pool.cudagraph_pool.id, manager.external_pools)
             self.assertGreater(baseline_restores, 0)
+
+        def test_managed_mempool_outlives_manager(self):
+            # A new manager first seeing a pool that still holds an output of a
+            # reset manager must not keep that block once the output dies.
+            pool = _LocalizationMemPool()
+            x = torch.ones(1024, device="cuda")
+            y = torch.compile(self._add_one_in_pool, mode="reduce-overhead")(pool, x)
+            torch._inductor.cudagraph_trees.reset_cudagraph_trees()
+            torch._dynamo.reset()
+
+            f = torch.compile(lambda t: t.sin(), mode="reduce-overhead")
+            g = torch.compile(self._add_one_in_pool, mode="reduce-overhead")
+            for _ in range(3):
+                torch.compiler.cudagraph_mark_step_begin()
+                f(x)
+            torch.compiler.cudagraph_mark_step_begin()
+            g(pool, x)
+            del y
+            for _ in range(3):
+                torch.compiler.cudagraph_mark_step_begin()
+                # Holding f's output records g under f's node, whose checkpoint
+                # predates the pool.
+                a = f(x)
+                self.assertEqual(g(pool, x), x + 1)
+            del a
+            segments = pool.cudagraph_pool.snapshot()
+            blocks = [b["state"] for s in segments for b in s["blocks"]]
+            self.assertNotIn("active_allocated", blocks)
+
+        def test_managed_mempool_cudagraphs_backend(self):
+            # Only Inductor hands a graph's pools to cudagraph trees, so the
+            # cudagraphs backend runs a graph using a localization pool eagerly.
+            pool = _LocalizationMemPool()
+            x = torch.ones(16, device="cuda")
+            counters.clear()
+            opt = torch.compile(self._add_one_in_pool, backend="cudagraphs")
+            for _ in range(3):
+                self.assertEqual(opt(pool, x), x + 1)
+            self.assertEqual(counters["inductor"]["cudagraph_skips"], 1)
+            self.assertIsNone(self.get_manager())
 
         @config.patch({"fx_graph_cache": True, "force_disable_caches": False})
         def test_managed_mempool_cache_hit(self):

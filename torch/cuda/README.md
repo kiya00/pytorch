@@ -111,7 +111,8 @@ There is also additional overhead during `torch.cuda.localize`, as it reallocate
 weights using a slower mechanism than the normal allocator.
 
 CUDA graphs reduce CPU launch overhead by replaying the captured work.
-Use `torch.compile(..., mode='reduce-overhead')` to enable CUDA graphs.
+Use `torch.compile(..., mode='reduce-overhead')` to enable CUDA graphs. Other CUDA graph
+backends, such as `backend="cudagraphs"`, run localized modules without CUDA graphs.
 Localized modules, eager or compiled, must only be called from a single thread.
 
 #### No cost model

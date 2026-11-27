@@ -32,6 +32,10 @@ import torch.fx
 from torch._dynamo import config
 from torch._dynamo.backends.common import aot_autograd
 from torch._dynamo.backends.debugging import boxed_nop
+from torch._dynamo.graph_bytecode_inputs import (
+    get_external_object_by_index,
+    install_active_registry,
+)
 from torch._inductor.cudagraph_utils import (
     BoxedDeviceIndex,
     check_multiple_devices_or_any_cpu_nodes,
@@ -47,6 +51,7 @@ from torch._inductor.utils import (
     num_fw_fixed_arguments,
     output_node,
 )
+from torch.cuda.memory import _LocalizationMemPool
 from torch.multiprocessing.reductions import StorageWeakRef
 
 from .registry import register_backend
@@ -131,6 +136,18 @@ def check_for_skip(aot_model: torch.fx.GraphModule, num_fixed: int) -> str | Non
 
     if node := get_first_incompatible_cudagraph_node(aot_model):
         return format_default_skip_message(f"incompatible op ({node.name})")
+
+    # Only Inductor hands a graph's localization pools to cudagraph trees, which
+    # must manage every pool a recording allocates from.
+    mempool_begins = aot_model.graph.find_nodes(
+        op="call_function", target=torch.ops.mempool.begin.default
+    )
+    if mempool_begins:
+        install_active_registry()
+    for node in mempool_begins:
+        pool = get_external_object_by_index(node.args[1])
+        if isinstance(pool, _LocalizationMemPool):
+            return "localization MemPools, which only Inductor supports"
 
     return None
 

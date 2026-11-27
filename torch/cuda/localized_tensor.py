@@ -673,6 +673,9 @@ def localize(
         inside their per-branch execution pools after the call returns.
         Localized modules, eager or compiled, must only be called from a
         single thread.
+        Only ``torch.compile(..., mode="reduce-overhead")`` runs localized
+        modules in CUDA graphs; other CUDA graph backends, such as
+        ``backend="cudagraphs"``, run them without CUDA graphs.
 
     Args:
         module: the module (or model) to walk. Mutated in place.
